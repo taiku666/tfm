@@ -5,6 +5,8 @@ Omarchy/Hyprland. Ships **two front-ends that share one core**: a
 dependency-free terminal UI, and an optional GTK4/libadwaita GUI that
 follows your Omarchy theme automatically.
 
+**USE AT YOUR OWN RISK - THIS SW IS STILL IN EARLY STAGE
+
 > Built with AI — this project was developed with the help of Claude Code.
 
 <p align="center">
