@@ -2,3 +2,5 @@
 build/
 bin/
 delme_test_ordner/
+
+.claude/
