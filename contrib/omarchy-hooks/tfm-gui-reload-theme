@@ -1,0 +1,14 @@
+#!/bin/bash
+
+# Omarchy theme-set.d hook for tfm-gui.
+#
+# Called by omarchy-theme-set after each theme change. Signals tfm-gui's
+# SIGUSR1 handler (src_gui/gui_main.c: on_sigusr1) to re-read the active
+# theme and apply it live, without restarting.
+#
+# Not installed automatically — install with:
+#   make install-gui-theme-hook
+
+pkill -USR1 -x tfm-gui 2>/dev/null
+
+exit 0

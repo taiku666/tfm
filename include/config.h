@@ -1,0 +1,39 @@
+#ifndef TFM_CONFIG_H
+#define TFM_CONFIG_H
+
+#include "tfm_common.h"
+
+typedef struct {
+    char left_path[PATH_MAX];
+    char right_path[PATH_MAX];
+    char border_color[32];        /* outer border: "system" or a color name, see screen.h */
+    char panel_border_color[32];  /* border of the two panels */
+    char text_color[32];          /* directory listing text color */
+    char cursor_color[32];        /* selection bar color */
+    char icons[16];                /* "omarchy" (Nerd Font icons) or "off" */
+    char gui_theme[16];            /* tfm-gui only: "omarchy" (take accent/
+                                     * light-dark from the active Omarchy theme)
+                                     * or "system" (default libadwaita/GNOME
+                                     * settings). "omarchy" falls back to
+                                     * "system" automatically when no Omarchy
+                                     * theme is found. */
+    char editor_extensions[256];   /* comma-separated list of extensions
+                                     * (no dot) for which Enter opens the
+                                     * editor; see config_is_editor_extension(). */
+} Config;
+
+/* Fills cfg with sane defaults ($HOME as start dir for both panels,
+ * falling back to "/" if $HOME is unset). */
+void config_set_defaults(Config *cfg);
+
+/* Loads config from ~/.tfm/tfm.ini, or defaults if the file doesn't exist. */
+void config_load(Config *cfg);
+
+/* Saves config to ~/.tfm/tfm.ini, creating ~/.tfm if needed. */
+void config_save(const Config *cfg);
+
+/* Checks whether filename's extension (case-insensitive) is in
+ * cfg->editor_extensions. Returns 1 on match, 0 otherwise. */
+int config_is_editor_extension(const Config *cfg, const char *filename);
+
+#endif
