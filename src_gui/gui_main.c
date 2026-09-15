@@ -113,14 +113,55 @@ static void focus_panel(int index)
     gtk_widget_grab_focus(g_panel[index].list_view);
 }
 
-/* Reloads panel with path. On read error, the old path/contents are left
- * unchanged. */
-static void panel_load(GuiPanel *panel, const char *path)
+static void show_error_dialog(const char *title, const char *message);
+
+/* Holds an initial-load-failure message (see panel_load() below) until
+ * the main window is actually presented. panel_load()'s initial-failure
+ * branch runs from build_panel_widget(), which activate() calls before
+ * gtk_window_present() - calling show_error_dialog() straight from there
+ * was tried and hung the whole app: AdwAlertDialog's blocking nested
+ * g_main_loop_run() never returns because the dialog's parent window
+ * (g_window) isn't mapped yet, so the dialog itself never becomes visible
+ * to be answered. Sized for two independent messages (one per panel; see
+ * the g_idle_add() flush in activate()). */
+static char g_pending_panel_load_error[2][PATH_MAX * 2 + 64];
+
+/* Reloads panel with path. On a reload failure (panel already has a
+ * valid path/listing), the old path/contents are left unchanged - same
+ * fallback contract as the TUI's panel_reload(), for a transient error
+ * like a flaky mount. On an *initial*-load failure (panel->path is still
+ * empty, i.e. no valid state exists to fall back to), silently leaving
+ * it empty would misdirect every subsequent path_join(panel->path, name)
+ * to "/name" (filesystem root) with no indication anything went wrong,
+ * and on exit on_shutdown() would persist that empty path into tfm.ini -
+ * so this case instead records an error message (see
+ * g_pending_panel_load_error above) and falls back once to $HOME (or "/"
+ * as a last resort). panel_index selects which of the two panels' pending-
+ * message slots to use; it's only consulted on this initial-failure path
+ * (panel_load()'s only other caller with an unset panel->path). */
+static void panel_load_indexed(GuiPanel *panel, const char *path, int panel_index)
 {
     DirEntryInfo *entries = NULL;
     size_t count = 0;
     if (dir_list(path, &entries, &count) != 0) {
-        return;
+        if (panel->path[0] != '\0') {
+            return;
+        }
+
+        int saved_errno = errno;
+        const char *home = getenv("HOME");
+        const char *fallback = (home != NULL && home[0] != '\0') ? home : "/";
+        char *out = g_pending_panel_load_error[panel_index];
+        size_t out_size = sizeof(g_pending_panel_load_error[panel_index]);
+
+        if (strcmp(fallback, path) == 0 || dir_list(fallback, &entries, &count) != 0) {
+            snprintf(out, out_size, "Could not open \"%s\": %s", path, strerror(saved_errno));
+            return;
+        }
+
+        snprintf(out, out_size, "Could not open \"%s\": %s\nFalling back to \"%s\".", path,
+                 strerror(saved_errno), fallback);
+        path = fallback;
     }
 
     g_list_store_remove_all(panel->store);
@@ -141,6 +182,16 @@ static void panel_load(GuiPanel *panel, const char *path)
     if (panel->path_label != NULL) {
         gtk_label_set_label(GTK_LABEL(panel->path_label), panel->path);
     }
+}
+
+/* Every caller except build_panel_widget()'s initial load already has a
+ * non-empty panel->path (a normal reload of an already-loaded panel), so
+ * panel_load_indexed()'s initial-failure branch - the only place
+ * panel_index is read - can never trigger here; the index value is
+ * irrelevant. */
+static void panel_load(GuiPanel *panel, const char *path)
+{
+    panel_load_indexed(panel, path, 0);
 }
 
 static void panel_navigate_into(GuiPanel *panel, const char *name)
@@ -169,6 +220,18 @@ static void panel_navigate_into(GuiPanel *panel, const char *name)
             return;
         }
     }
+
+    /* Pre-check readability, mirroring builtin_cd()'s own opendir() probe:
+     * panel_load() treats a failure here as a transient reload error and
+     * silently keeps the old listing, so without this check a now-
+     * unreadable directory would double-click into nothing. */
+    DIR *dp = opendir(new_path);
+    if (dp == NULL) {
+        show_error_dialog("Error", strerror(errno));
+        return;
+    }
+    closedir(dp);
+
     panel_load(panel, new_path);
 }
 
@@ -330,8 +393,6 @@ static void on_factory_bind(GtkSignalListItemFactory *factory, GtkListItem *list
     gtk_label_set_label(GTK_LABEL(label), item->name);
 }
 
-static void show_error_dialog(const char *title, const char *message);
-
 /* Pumps pending GTK events while editor_open_cb() waits on the external
  * editor process - otherwise the window would appear frozen for the
  * whole editor session (same pattern used by gui_fileop_on_progress()
@@ -414,7 +475,12 @@ static GtkWidget *build_panel_widget(GuiPanel *panel, const char *initial_path)
     gtk_box_append(GTK_BOX(box), scrolled);
     panel->container = box;
 
-    panel_load(panel, initial_path);
+    /* panel is always one of the two slots in the global g_panel[] array
+     * (see activate()'s two build_panel_widget() calls) - pointer
+     * arithmetic recovers which one, so panel_load_indexed()'s
+     * initial-failure path (see its doc comment) can record its message
+     * into that panel's own slot. */
+    panel_load_indexed(panel, initial_path, (int)(panel - g_panel));
 
     return box;
 }
@@ -427,47 +493,6 @@ static int gui_is_cd_command(const char *command)
     return strncmp(command, "cd", 2) == 0 && (command[2] == '\0' || command[2] == ' ');
 }
 
-static int gui_builtin_cd(char *current_dir, const char *command, char *error_msg,
-                           size_t error_msg_size)
-{
-    const char *arg = command + 2;
-    while (*arg == ' ') {
-        arg++;
-    }
-
-    char raw_path[PATH_MAX];
-    if (*arg == '\0') {
-        const char *home = getenv("HOME");
-        snprintf(raw_path, sizeof(raw_path), "%s", home != NULL ? home : "/");
-    } else if (arg[0] == '/') {
-        snprintf(raw_path, sizeof(raw_path), "%s", arg);
-    } else {
-        snprintf(raw_path, sizeof(raw_path), "%s/%s", current_dir, arg);
-    }
-
-    char resolved[PATH_MAX];
-    if (realpath(raw_path, resolved) == NULL) {
-        snprintf(error_msg, error_msg_size, "Directory not found");
-        return 0;
-    }
-
-    struct stat st;
-    if (stat(resolved, &st) != 0 || !S_ISDIR(st.st_mode)) {
-        snprintf(error_msg, error_msg_size, "Not a directory");
-        return 0;
-    }
-
-    DIR *dp = opendir(resolved);
-    if (dp == NULL) {
-        snprintf(error_msg, error_msg_size, "Permission denied for this directory");
-        return 0;
-    }
-    closedir(dp);
-
-    snprintf(current_dir, PATH_MAX, "%s", resolved);
-    return 1;
-}
-
 /* Runs the entered command in the focused panel's directory and reloads
  * both panels afterward in case the command changed files. */
 static void on_shell_entry_activate(GtkEntry *entry, gpointer user_data)
@@ -478,13 +503,29 @@ static void on_shell_entry_activate(GtkEntry *entry, gpointer user_data)
 
     if (gui_is_cd_command(command)) {
         char error_msg[128];
-        if (!gui_builtin_cd(active->path, command, error_msg, sizeof(error_msg))) {
+        if (!builtin_cd(active->path, command, error_msg, sizeof(error_msg))) {
             show_error_dialog("Error", error_msg);
-        } else {
-            panel_load(active, active->path);
         }
+        /* No panel_load() here on success: both panels are unconditionally
+         * reloaded below (a plain shell command can also touch either
+         * panel's directory), so reloading `active` here too would just
+         * do the same opendir()+readdir()+stat() listing twice. */
     } else {
-        int exit_code = shell_execute(command, active->path);
+        /* shell_execute() waits via a single blocking waitpid() with no
+         * event pumping (pump == NULL) - tfm-gui is single-threaded, so
+         * that freezes the whole window ("Not Responding") for the
+         * command's entire duration. Use shell_execute_cb() with
+         * gui_pump_main_context() instead, exactly like editor_open_cb()
+         * already does for $EDITOR launches. gui_modal_enter()/leave()
+         * bracket the pumped wait so re-entrant F5-F8/F10/Tab are blocked
+         * while a command is running, same as every other pumping call in
+         * this file (fileops progress, editor launches) - without it, a
+         * long-running "sleep 5" or "git clone" in the shell bar would let
+         * F8 delete fire on the active panel out from under the still-
+         * running command. */
+        gui_modal_enter();
+        int exit_code = shell_execute_cb(command, active->path, gui_pump_main_context, NULL);
+        gui_modal_leave();
         if (exit_code != 0) {
             char message[300];
             snprintf(message, sizeof(message), "Exit code %d: %s", exit_code, command);
@@ -1038,12 +1079,101 @@ static void apply_base_css(void)
     g_object_unref(provider);
 }
 
-/* Reads the font size configured in foot (Omarchy's default terminal)
- * from "font=<Name>:size=<N>" in ~/.config/foot/foot.ini, so tfm-gui
- * starts at the same size as the terminal UI. Returns a sensible default
- * on error/missing value. */
+/* Checks whether foot.desktop is the first (highest-priority) entry in
+ * one xdg-terminals.list file, i.e. whether foot is actually the user's
+ * configured default terminal. */
+static int xdg_terminals_list_picks_foot(const char *path)
+{
+    FILE *fp = fopen(path, "r");
+    if (fp == NULL) {
+        return -1; /* file doesn't exist - caller should try the next one */
+    }
+    int result = -1;
+    char line[256];
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') {
+            p++;
+        }
+        if (*p == '#' || *p == '\n' || *p == '\0') {
+            continue;
+        }
+        size_t len = strlen(p);
+        while (len > 0 && (p[len - 1] == '\n' || p[len - 1] == '\r' ||
+                            p[len - 1] == ' ' || p[len - 1] == '\t')) {
+            p[--len] = '\0';
+        }
+        result = (strcmp(p, "foot.desktop") == 0);
+        break;
+    }
+    fclose(fp);
+    return result;
+}
+
+/* Determines whether foot is the user's actually configured default
+ * terminal, following the same xdg-terminals.list search order as
+ * xdg-terminal-exec itself: $XDG_CONFIG_HOME (or ~/.config), then
+ * $XDG_CONFIG_DIRS (or /etc/xdg), each checked both directly and under an
+ * "xdg-terminal-exec/" subdirectory. The first file that exists wins;
+ * without any such file, Omarchy's own packaged default list also names
+ * foot, so that's the final fallback. */
+static int is_foot_the_active_terminal(void)
+{
+    const char *home = getenv("HOME");
+    const char *config_home = getenv("XDG_CONFIG_HOME");
+    const char *config_dirs = getenv("XDG_CONFIG_DIRS");
+    char dir_buf[PATH_MAX];
+    const char *dirs[2];
+    int ndirs = 0;
+
+    if (config_home != NULL && config_home[0] != '\0') {
+        dirs[ndirs++] = config_home;
+    } else if (home != NULL) {
+        snprintf(dir_buf, sizeof(dir_buf), "%s/.config", home);
+        dirs[ndirs++] = dir_buf;
+    }
+    /* Only the first $XDG_CONFIG_DIRS entry is checked here (matching this
+     * function's scope: "is foot active", not a full multi-dir search) -
+     * good enough since Omarchy/most distros set a single-entry default of
+     * /etc/xdg. */
+    const char *config_dirs_first = (config_dirs != NULL && config_dirs[0] != '\0')
+                                         ? config_dirs
+                                         : "/etc/xdg";
+    dirs[ndirs++] = config_dirs_first;
+
+    for (int i = 0; i < ndirs; i++) {
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/xdg-terminal-exec/xdg-terminals.list", dirs[i]);
+        int r = xdg_terminals_list_picks_foot(path);
+        if (r >= 0) {
+            return r;
+        }
+        snprintf(path, sizeof(path), "%s/xdg-terminals.list", dirs[i]);
+        r = xdg_terminals_list_picks_foot(path);
+        if (r >= 0) {
+            return r;
+        }
+    }
+
+    return xdg_terminals_list_picks_foot(
+               "/usr/share/omarchy/default/xdg-terminal-exec/hyprland-xdg-terminals.list") != 0;
+}
+
+/* Reads the font size configured in foot from "font=<Name>:size=<N>" in
+ * ~/.config/foot/foot.ini, so tfm-gui starts at the same size as the
+ * terminal UI - but only when foot is actually the user's active default
+ * terminal (see is_foot_the_active_terminal()): tfm-gui only knows how to
+ * parse foot's config format, and blindly trusting foot.ini regardless of
+ * which terminal is actually configured would silently apply the wrong
+ * terminal's font size (e.g. an alacritty/kitty/ghostty user who happens
+ * to still have a stale/default foot.ini lying around). Returns a
+ * sensible default on error/missing value/non-foot terminal. */
 static double read_terminal_font_size(void)
 {
+    if (!is_foot_the_active_terminal()) {
+        return 11.0;
+    }
+
     const char *home = getenv("HOME");
     if (home == NULL) {
         return 11.0;
@@ -1221,6 +1351,28 @@ static gboolean on_window_close_request(GtkWindow *window, gpointer user_data)
     return FALSE; /* allow normal close */
 }
 
+/* Flushes g_pending_panel_load_error (see panel_load_indexed()) once the
+ * main window is actually mapped - scheduled via g_idle_add() rather than
+ * called directly after gtk_window_present() below, since present() only
+ * requests mapping; showing a blocking modal immediately afterward, still
+ * synchronously within activate(), hit the same hang this whole mechanism
+ * exists to avoid (see panel_load_indexed()'s doc comment) because the
+ * window hadn't actually been realized by the compositor yet. Letting the
+ * main loop run at least one iteration first (idle callbacks fire on the
+ * next iteration) reliably gets a real mapped window before the dialog
+ * needs one. */
+static gboolean flush_pending_panel_load_errors(gpointer user_data)
+{
+    (void)user_data;
+    for (size_t i = 0; i < G_N_ELEMENTS(g_pending_panel_load_error); i++) {
+        if (g_pending_panel_load_error[i][0] != '\0') {
+            show_error_dialog("Error", g_pending_panel_load_error[i]);
+            g_pending_panel_load_error[i][0] = '\0';
+        }
+    }
+    return G_SOURCE_REMOVE;
+}
+
 static void activate(GtkApplication *app, gpointer user_data)
 {
     (void)user_data;
@@ -1289,16 +1441,30 @@ static void activate(GtkApplication *app, gpointer user_data)
 
     focus_panel(0);
     gtk_window_present(GTK_WINDOW(window));
+
+    if (g_pending_panel_load_error[0][0] != '\0' || g_pending_panel_load_error[1][0] != '\0') {
+        g_idle_add(flush_pending_panel_load_errors, NULL);
+    }
 }
 
 /* Unlike the terminal UI, the GUI has no "actual" sentinel for left_path
- * - both panel paths are saved directly from current state. */
+ * - both panel paths are saved directly from current state. A panel's
+ * path can still be empty here if its initial load AND panel_load()'s
+ * own $HOME/"/" fallback both failed (see panel_load()) - in that
+ * unrecoverable case, leave g_cfg's already-loaded value for that field
+ * untouched instead of overwriting it with "", so the original (if
+ * still-broken) configured path survives in tfm.ini for the user to fix,
+ * rather than being silently replaced by an empty one. */
 static void on_shutdown(GApplication *app, gpointer user_data)
 {
     (void)app;
     (void)user_data;
-    snprintf(g_cfg.left_path, sizeof(g_cfg.left_path), "%s", g_panel[0].path);
-    snprintf(g_cfg.right_path, sizeof(g_cfg.right_path), "%s", g_panel[1].path);
+    if (g_panel[0].path[0] != '\0') {
+        snprintf(g_cfg.left_path, sizeof(g_cfg.left_path), "%s", g_panel[0].path);
+    }
+    if (g_panel[1].path[0] != '\0') {
+        snprintf(g_cfg.right_path, sizeof(g_cfg.right_path), "%s", g_panel[1].path);
+    }
     config_save(&g_cfg);
 }
 

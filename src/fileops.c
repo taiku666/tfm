@@ -96,6 +96,12 @@ static long long compute_total_size(const char *path, const FileOpCallbacks *cb)
     return total;
 }
 
+/* Forward declaration: copy_file() needs to remove an existing destination
+ * on overwrite (including a directory-vs-file type mismatch), but
+ * remove_existing_for_overwrite() is defined further below. */
+static int remove_existing_for_overwrite(const char *dest, const struct stat *dest_st,
+                                          const FileOpCallbacks *cb);
+
 /* Copies a single file. Returns 1 on success or if the user skipped it,
  * 0 if the operation should abort. */
 static int copy_file(const char *src_path, const char *dest_path, CopyProgress *progress,
@@ -143,13 +149,20 @@ static int copy_file(const char *src_path, const char *dest_path, CopyProgress *
              * or skips rather than silently overwriting. */
             return choice == FILEOPS_CHOICE_SKIP;
         }
-        /* Remove the existing entry by name (don't follow it). lstat()
-         * above catches a symlink itself (dangling or not), but a
-         * subsequent fopen(dest_path, "wb") would follow it and
+        /* Remove the existing entry. If it's a directory, unlink() would
+         * fail (EISDIR) and fall through to O_EXCL failing EEXIST,
+         * producing an infinite Retry loop with no indication of the real
+         * cause - route through remove_existing_for_overwrite() (shared
+         * with copy_recursive()'s type-mismatch handling) so a directory
+         * is removed recursively instead. For a plain file/symlink this
+         * still removes it by name (not following it): a subsequent
+         * fopen(dest_path, "wb") would follow a symlink and
          * open/truncate its target instead - a different file than the
-         * one just confirmed. unlink() + O_EXCL below close this TOCTOU
+         * one just confirmed. That + O_EXCL below close this TOCTOU
          * window. */
-        unlink(dest_path);
+        if (!remove_existing_for_overwrite(dest_path, &existing, cb)) {
+            return 0;
+        }
     }
 
     /* Tracks whether dest_path was already (re)created in this call: a
@@ -316,13 +329,16 @@ static int copy_recursive(const char *src, const char *dest, CopyProgress *progr
     }
 
     for (;;) {
-        /* mkdir() masks the mode with umask, unlike fchmod() in copy_file();
-         * preserve the source's permissions explicitly instead of a fixed
-         * 0755, or e.g. a private 0700 directory would be copied as 0755.
-         * On EEXIST, an already-existing destination directory's
-         * permissions are left untouched (no downgrade of a deliberately
-         * set permission via merge). */
+        /* mkdir()'s mode argument is masked by umask, so passing
+         * st.st_mode here alone is not enough to preserve the source's
+         * permissions - a 0777/0775 shared directory would silently come
+         * out as 0755 under a typical umask 022. A follow-up chmod() below
+         * (on the newly-created-here path only) closes that gap, mirroring
+         * fchmod() in copy_file(). On EEXIST, an already-existing
+         * destination directory's permissions are left untouched (no
+         * downgrade of a deliberately set permission via merge). */
         if (mkdir(dest, st.st_mode & 07777) == 0) {
+            chmod(dest, st.st_mode & 07777);
             break;
         }
         if (errno == EEXIST) {
@@ -433,7 +449,15 @@ static void strip_trailing_slashes(char *path)
 void fileops_copy(const char *src, const char *dest_dir, const FileOpCallbacks *cb)
 {
     char normalized_src[PATH_MAX];
-    snprintf(normalized_src, sizeof(normalized_src), "%s", src);
+    /* Unlike path_join() elsewhere in this file, a truncated src here
+     * can't just be caught by the caller re-checking dest - it would
+     * silently operate on a different, shorter path than the one passed
+     * in, so check the return value explicitly instead of ignoring it. */
+    if ((size_t)snprintf(normalized_src, sizeof(normalized_src), "%s", src) >=
+        sizeof(normalized_src)) {
+        report_error(cb, "Path too long", src);
+        return;
+    }
     strip_trailing_slashes(normalized_src);
     src = normalized_src;
 
@@ -450,6 +474,11 @@ void fileops_copy(const char *src, const char *dest_dir, const FileOpCallbacks *
     char dest[PATH_MAX];
     if (!path_join(dest, sizeof(dest), dest_dir, base)) {
         report_error(cb, "Path too long", base);
+        return;
+    }
+
+    if (strcmp(src, dest) == 0) {
+        report_error(cb, "Error", "Source and destination are the same file");
         return;
     }
 
@@ -543,7 +572,14 @@ static int delete_recursive(const char *path, const FileOpCallbacks *cb)
 void fileops_move(const char *src, const char *dest_dir, const FileOpCallbacks *cb)
 {
     char normalized_src[PATH_MAX];
-    snprintf(normalized_src, sizeof(normalized_src), "%s", src);
+    /* See the matching check in fileops_copy(): a truncated src here would
+     * silently operate on a different, shorter path than the one passed
+     * in, so check the return value explicitly instead of ignoring it. */
+    if ((size_t)snprintf(normalized_src, sizeof(normalized_src), "%s", src) >=
+        sizeof(normalized_src)) {
+        report_error(cb, "Path too long", src);
+        return;
+    }
     strip_trailing_slashes(normalized_src);
     src = normalized_src;
 

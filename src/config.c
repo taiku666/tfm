@@ -107,9 +107,14 @@ void config_load(Config *cfg)
         char *value = trim(eq + 1);
 
         if (strcmp(section, "panels") == 0) {
-            if (strcmp(key, "left_path") == 0) {
+            /* An empty/whitespace-only value (value[0] == '\0' after
+             * trim()) is left as the config_set_defaults() default
+             * ($HOME) instead of overwriting it with "" - an empty path
+             * would otherwise feed path_join() as "/name" for every
+             * subsequent operation in that panel. */
+            if (strcmp(key, "left_path") == 0 && value[0] != '\0') {
                 snprintf(cfg->left_path, sizeof(cfg->left_path), "%s", value);
-            } else if (strcmp(key, "right_path") == 0) {
+            } else if (strcmp(key, "right_path") == 0 && value[0] != '\0') {
                 snprintf(cfg->right_path, sizeof(cfg->right_path), "%s", value);
             }
         } else if (strcmp(section, "display") == 0) {

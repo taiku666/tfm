@@ -77,9 +77,9 @@ int dir_list(const char *path, DirEntryInfo **out_entries, size_t *out_count)
              * fall back to stat() (not lstat, so a symlink to a directory
              * is treated as a directory). */
             char full_path[PATH_MAX];
-            snprintf(full_path, sizeof(full_path), "%s/%s", path, entry->d_name);
             struct stat st;
-            entries[count].is_dir = (stat(full_path, &st) == 0 && S_ISDIR(st.st_mode));
+            entries[count].is_dir = path_join(full_path, sizeof(full_path), path, entry->d_name) &&
+                                     stat(full_path, &st) == 0 && S_ISDIR(st.st_mode);
         } else {
             entries[count].is_dir = 0;
         }

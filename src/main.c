@@ -1,6 +1,5 @@
 #define _DEFAULT_SOURCE
 
-#include <dirent.h>
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>
@@ -115,56 +114,6 @@ static int is_cd_command(const char *command)
 {
     return strncmp(command, "cd", 2) == 0 &&
            (command[2] == '\0' || command[2] == ' ');
-}
-
-static int builtin_cd(char *current_dir, const char *command, char *error_msg, size_t error_msg_size)
-{
-    const char *arg = command + 2;
-    while (*arg == ' ') {
-        arg++;
-    }
-
-    char raw_path[PATH_MAX];
-    if (*arg == '\0') {
-        const char *home = getenv("HOME");
-        snprintf(raw_path, sizeof(raw_path), "%s", home != NULL ? home : "/");
-    } else if (arg[0] == '/') {
-        snprintf(raw_path, sizeof(raw_path), "%s", arg);
-    } else {
-        snprintf(raw_path, sizeof(raw_path), "%s/%s", current_dir, arg);
-    }
-
-    char resolved[PATH_MAX];
-    if (realpath(raw_path, resolved) == NULL) {
-        if (error_msg != NULL) {
-            snprintf(error_msg, error_msg_size, "Directory not found");
-        }
-        return 0;
-    }
-
-    struct stat st;
-    if (stat(resolved, &st) != 0 || !S_ISDIR(st.st_mode)) {
-        if (error_msg != NULL) {
-            snprintf(error_msg, error_msg_size, "Not a directory");
-        }
-        return 0;
-    }
-
-    /* Also verify the directory is actually readable (e.g. root-owned
-     * systemd-private-* dirs in /tmp look like directories but aren't
-     * openable by normal users) to avoid landing in an empty, unusable
-     * panel. */
-    DIR *dp = opendir(resolved);
-    if (dp == NULL) {
-        if (error_msg != NULL) {
-            snprintf(error_msg, error_msg_size, "Permission denied for this directory");
-        }
-        return 0;
-    }
-    closedir(dp);
-
-    snprintf(current_dir, PATH_MAX, "%s", resolved);
-    return 1;
 }
 
 static int enter_selected_entry(Panel *panel, char *error_msg, size_t error_msg_size)
@@ -331,6 +280,14 @@ int main(void)
         }
 
         if (any_invalid) {
+            /* screen_set_progress_bar_color() was already called above
+             * with the raw, unvalidated cfg.border_color - if that field
+             * was one of the ones just fixed up to "system", the cached
+             * progress-bar color needs refreshing too, or every progress
+             * popup for the rest of the session keeps using the invalid
+             * (colorless) name despite this warning saying it was fixed. */
+            screen_set_progress_bar_color(cfg.border_color);
+
             char full_msg[300];
             snprintf(full_msg, sizeof(full_msg), "Unknown color in tfm.ini: %s (using system)", invalid_msg);
             tui_show_popup("Config warning", full_msg);

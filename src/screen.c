@@ -174,6 +174,18 @@ static void move_cursor(int row, int col)
     printf("\x1b[%d;%dH", row, col);
 }
 
+/* Blanks a rectangle with spaces - erases a popup box's previous
+ * footprint before it's redrawn at a new size/position. */
+static void clear_rect(int start_row, int start_col, int height, int width)
+{
+    for (int r = 0; r < height; r++) {
+        move_cursor(start_row + r, start_col);
+        for (int c = 0; c < width; c++) {
+            putchar(' ');
+        }
+    }
+}
+
 /* Counts visible columns, not bytes: UTF-8 continuation bytes (10xxxxxx)
  * don't count. Assumes every codepoint is 1 column wide (fine for
  * icons/latin umlauts, not for e.g. CJK wide chars). strlen() would
@@ -679,18 +691,6 @@ void screen_draw_progress_popup(const char *title, const char *item, double perc
         snprintf(item_display, sizeof(item_display), "%s", truncated);
     }
 
-    /* Pad with ASCII spaces to inner_width visible columns by hand,
-     * rather than a printf field width, which would miscount for
-     * multibyte content. */
-    char percent_line_padded[384];
-    snprintf(percent_line_padded, sizeof(percent_line_padded), "%s", percent_line);
-    int pad_needed = inner_width - percent_line_visual_width;
-    size_t padded_len = strlen(percent_line_padded);
-    for (int i = 0; i < pad_needed && padded_len + 1 < sizeof(percent_line_padded); i++) {
-        percent_line_padded[padded_len++] = ' ';
-    }
-    percent_line_padded[padded_len] = '\0';
-
     int start_row = (rows - 5) / 2;
     if (start_row < 2) {
         start_row = 2;
@@ -719,8 +719,9 @@ void screen_draw_progress_popup(const char *title, const char *item, double perc
     printf(" " POPUP_VERTICAL);
 
     move_cursor(start_row + 3, start_col);
-    printf(POPUP_VERTICAL " %s%s" ANSI_RESET " " POPUP_VERTICAL, border_color_lookup(g_progress_bar_color),
-           percent_line_padded);
+    printf(POPUP_VERTICAL " %s", border_color_lookup(g_progress_bar_color));
+    print_utf8_padded(percent_line, inner_width);
+    printf(ANSI_RESET " " POPUP_VERTICAL);
 
     move_cursor(start_row + 4, start_col);
     printf(POPUP_BOTTOM_LEFT);
@@ -805,7 +806,16 @@ static int screen_prompt_buttons(const char *title, const char *message, const D
 {
     int selected = (default_index >= 0 && default_index < count) ? default_index : 0;
 
+    /* Geometry is recomputed every iteration and only actually changes on
+     * a real resize, but nothing clears the old box first - track it so
+     * it can be blanked before the next draw. */
+    int prev_start_row = -1, prev_start_col = -1, prev_box_width = 0;
+
     for (;;) {
+        if (prev_start_row >= 0) {
+            clear_rect(prev_start_row, prev_start_col, 5, prev_box_width);
+        }
+
         int rows, cols;
         screen_get_size(&rows, &cols);
 
@@ -839,6 +849,10 @@ static int screen_prompt_buttons(const char *title, const char *message, const D
         if (start_col < 2) {
             start_col = 2;
         }
+
+        prev_start_row = start_row;
+        prev_start_col = start_col;
+        prev_box_width = box_width;
 
         move_cursor(start_row, start_col);
         printf(POPUP_TOP_LEFT);
@@ -937,11 +951,23 @@ int screen_prompt_text(const char *title, char *buffer, size_t buffer_size)
 
     const char *hint = "Enter=OK  Esc=Cancel";
 
+    /* Box size depends on the current text length, so it shrinks on
+     * Backspace - track the last-drawn footprint so it can be blanked
+     * before the next draw, otherwise the old wider border lingers. */
+    int prev_start_row = -1, prev_start_col = -1, prev_box_width = 0;
+
     for (;;) {
+        if (prev_start_row >= 0) {
+            clear_rect(prev_start_row, prev_start_col, 5, prev_box_width);
+        }
+
         const char *lines[3] = {title, edited, hint};
         int start_row, start_col, inner_width;
         draw_popup_frame(lines, &start_row, &start_col, &inner_width);
-        (void)inner_width;
+
+        prev_start_row = start_row;
+        prev_start_col = start_col;
+        prev_box_width = inner_width + 4;
 
         /* Position the cursor at the end of the edited text using visible
          * columns, not bytes, so umlauts in the name don't throw it off. */
