@@ -10,9 +10,9 @@ follows your Omarchy theme automatically.
 > Built with AI — this project was developed with the help of Claude Code.
 
 <p align="center">
-  <img src="screenshots/tui.png" alt="tfm terminal UI — dual-panel view" width="46%">
+  <img src="screenshots/themes/tui-ristretto.png" alt="tfm terminal UI — dual-panel view" width="46%">
   &nbsp;&nbsp;
-  <img src="screenshots/gui.png" alt="tfm-gui — dual-panel view" width="46%">
+  <img src="screenshots/themes/gui-ristretto.png" alt="tfm-gui — dual-panel view" width="46%">
 </p>
 <p align="center"><em>Left: <code>tfm</code> in the terminal. Right: <code>tfm-gui</code>, both themed by the same live Omarchy accent color.</em></p>
 
@@ -34,6 +34,46 @@ follows your Omarchy theme automatically.
   <img src="screenshots/gui-overwrite.png" alt="tfm-gui overwrite conflict dialog" width="50%">
 </p>
 <p align="center"><em>Every destructive operation — copy, move, delete — confirms before it overwrites anything.</em></p>
+
+## Theme gallery
+
+Both front-ends pick up the active [Omarchy](https://omarchy.org) theme live —
+no restart needed. A few examples:
+
+<p align="center">
+  <img src="screenshots/themes/tui-osaka-jade.png" alt="tfm — Osaka Jade theme" width="46%">
+  &nbsp;&nbsp;
+  <img src="screenshots/themes/gui-osaka-jade.png" alt="tfm-gui — Osaka Jade theme" width="46%">
+</p>
+<p align="center"><em>Osaka Jade</em></p>
+
+<p align="center">
+  <img src="screenshots/themes/tui-ristretto.png" alt="tfm — Ristretto theme" width="46%">
+  &nbsp;&nbsp;
+  <img src="screenshots/themes/gui-ristretto.png" alt="tfm-gui — Ristretto theme" width="46%">
+</p>
+<p align="center"><em>Ristretto</em></p>
+
+<p align="center">
+  <img src="screenshots/themes/tui-tokyo-night.png" alt="tfm — Tokyo Night theme" width="46%">
+  &nbsp;&nbsp;
+  <img src="screenshots/themes/gui-tokyo-night.png" alt="tfm-gui — Tokyo Night theme" width="46%">
+</p>
+<p align="center"><em>Tokyo Night</em></p>
+
+<p align="center">
+  <img src="screenshots/themes/tui-white.png" alt="tfm — White theme" width="46%">
+  &nbsp;&nbsp;
+  <img src="screenshots/themes/gui-white.png" alt="tfm-gui — White theme" width="46%">
+</p>
+<p align="center"><em>White</em></p>
+
+<p align="center">
+  <img src="screenshots/themes/tui-hackerman.png" alt="tfm — Hackerman theme" width="46%">
+  &nbsp;&nbsp;
+  <img src="screenshots/themes/gui-hackerman.png" alt="tfm-gui — Hackerman theme" width="46%">
+</p>
+<p align="center"><em>Hackerman</em></p>
 
 ## Requirements
 
