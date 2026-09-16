@@ -1,6 +1,7 @@
 #include "screen.h"
 
 #include <ctype.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
@@ -202,6 +203,28 @@ static int utf8_visual_width(const char *s)
     return width;
 }
 
+/* Byte length of the longest prefix of text that is at most max_columns
+ * visible columns wide - never cuts in the middle of a UTF-8 character.
+ * Shared by print_utf8_padded() and any other caller that needs to
+ * truncate/center text by codepoint instead of by byte (e.g.
+ * screen_draw_border()'s title, which used strlen()+"%.*s" before). */
+static size_t utf8_byte_len_for_width(const char *text, int max_columns)
+{
+    size_t byte_len = 0;
+    int col = 0;
+    while (text[byte_len] != '\0') {
+        unsigned char c = (unsigned char)text[byte_len];
+        if ((c & 0xC0) != 0x80) {
+            if (col == max_columns) {
+                break;
+            }
+            col++;
+        }
+        byte_len++;
+    }
+    return byte_len;
+}
+
 /* Prints text truncated/padded to visual_width visible columns (not
  * bytes) - never cuts in the middle of a UTF-8 character. */
 static void print_utf8_padded(const char *text, int visual_width)
@@ -210,17 +233,10 @@ static void print_utf8_padded(const char *text, int visual_width)
         visual_width = 0;
     }
 
-    size_t byte_len = 0;
-    int col = 0;
-    while (text[byte_len] != '\0') {
-        unsigned char c = (unsigned char)text[byte_len];
-        if ((c & 0xC0) != 0x80) {
-            if (col == visual_width) {
-                break;
-            }
-            col++;
-        }
-        byte_len++;
+    size_t byte_len = utf8_byte_len_for_width(text, visual_width);
+    int col = utf8_visual_width(text);
+    if (col > visual_width) {
+        col = visual_width;
     }
 
     printf("%.*s", (int)byte_len, text);
@@ -496,15 +512,20 @@ void screen_draw_border(const char *color_name, const char *title)
     printf(BOX_TOP_RIGHT);
 
     if (title != NULL && title[0] != '\0') {
-        int title_len = (int)strlen(title);
+        /* utf8_visual_width()/utf8_byte_len_for_width(), not strlen()+
+         * "%.*s" on the raw byte count: a multibyte title (umlauts, box-
+         * drawing/icon glyphs) would otherwise be mis-centered and could
+         * be truncated mid-character, producing garbage bytes. */
         int max_title_len = cols - 4;
         if (max_title_len > 0) {
+            int title_len = utf8_visual_width(title);
             if (title_len > max_title_len) {
                 title_len = max_title_len;
             }
+            size_t title_byte_len = utf8_byte_len_for_width(title, title_len);
             int title_col = (cols - title_len) / 2 + 1;
             move_cursor(1, title_col);
-            printf(" %.*s ", title_len, title);
+            printf(" %.*s ", (int)title_byte_len, title);
         }
     }
 
@@ -591,6 +612,12 @@ static void draw_popup_frame(const char *lines[3], int *out_start_row, int *out_
 
 void screen_draw_progress_popup(const char *title, const char *item, double percent)
 {
+    /* isnan() first: NaN compares false against everything, so both
+     * range checks below would silently pass it through to the (int)
+     * cast further down - undefined behavior. */
+    if (isnan(percent)) {
+        percent = 0;
+    }
     if (percent < 0) {
         percent = 0;
     }
@@ -659,7 +686,7 @@ void screen_draw_progress_popup(const char *title, const char *item, double perc
         max_inner_width = 10;
     }
 
-    int inner_width = (int)strlen(title);
+    int inner_width = utf8_visual_width(title);
     if (percent_line_visual_width > inner_width) {
         inner_width = percent_line_visual_width;
     }

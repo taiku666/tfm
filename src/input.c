@@ -55,14 +55,27 @@ void input_disable_raw_mode(void)
 
 void input_enable_raw_mode(void)
 {
-    tcgetattr(STDIN_FILENO, &g_orig_termios);
+    if (g_raw_mode_active) {
+        /* A second call would overwrite the already-raw g_orig_termios
+         * below, so a later input_disable_raw_mode() would "restore"
+         * raw mode instead of the real original settings. */
+        return;
+    }
+
+    if (tcgetattr(STDIN_FILENO, &g_orig_termios) != 0) {
+        /* Not a tty (e.g. piped/redirected stdin) - stay in cooked mode
+         * rather than proceeding with a garbage g_orig_termios. */
+        return;
+    }
 
     struct termios raw = g_orig_termios;
     raw.c_lflag &= ~(unsigned int)(ECHO | ICANON | ISIG);
     raw.c_cc[VMIN] = 1;
     raw.c_cc[VTIME] = 0;
 
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) != 0) {
+        return;
+    }
     g_raw_mode_active = 1;
 
     if (!g_atexit_registered) {
@@ -139,31 +152,40 @@ KeyEvent input_read_key(void)
     }
 
     /* Escape sequence: remaining bytes are usually already buffered;
-     * switch to non-blocking briefly to collect them. */
-    char seq[8];
+     * switch to non-blocking briefly to collect them. 32 bytes (not the
+     * old 8) so a longer sequence this table doesn't recognize (e.g. an
+     * xterm modified key like ESC[1;5A, or ESC[27;5;65~) gets fully
+     * drained instead of leaving trailing bytes in the kernel input
+     * buffer for the next input_read_key() call to misread as unrelated
+     * keystrokes. */
+    char seq[32];
     int seq_len = 0;
 
     int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
-    fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+    if (flags != -1 && fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK) == 0) {
+        while (seq_len < (int)sizeof(seq) - 1) {
+            char next;
+            ssize_t n = read(STDIN_FILENO, &next, 1);
+            if (n != 1) {
+                break;
+            }
+            seq[seq_len++] = next;
+            seq[seq_len] = '\0';
 
-    while (seq_len < (int)sizeof(seq) - 1) {
-        char next;
-        ssize_t n = read(STDIN_FILENO, &next, 1);
-        if (n != 1) {
-            break;
+            /* Stop as soon as the collected bytes exactly match a known
+             * sequence, so fast typing doesn't merge in the next
+             * keypress's bytes and lose both keys. */
+            if (lookup_esc_sequence(seq, seq_len) != KEY_UNKNOWN) {
+                break;
+            }
         }
-        seq[seq_len++] = next;
-        seq[seq_len] = '\0';
 
-        /* Stop as soon as the collected bytes exactly match a known
-         * sequence, so fast typing doesn't merge in the next keypress's
-         * bytes and lose both keys. */
-        if (lookup_esc_sequence(seq, seq_len) != KEY_UNKNOWN) {
-            break;
-        }
+        fcntl(STDIN_FILENO, F_SETFL, flags);
     }
-
-    fcntl(STDIN_FILENO, F_SETFL, flags);
+    /* If F_GETFL/F_SETFL failed, seq_len stays 0 and this falls through
+     * to plain KEY_ESC below - safer than looping on a read() that may
+     * still be blocking (nonblock was never actually enabled) and could
+     * hang indefinitely on a bare ESC with no more bytes coming. */
 
     if (seq_len == 0) {
         event.type = KEY_ESC;

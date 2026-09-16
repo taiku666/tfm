@@ -14,6 +14,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <glib-unix.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -263,12 +264,27 @@ static const char *contrasting_fg_for(const char *hex_color)
  * was found (e.g. outside Omarchy) - both cases just do nothing further. */
 static void apply_omarchy_theme(void)
 {
-    if (strcasecmp(g_cfg.gui_theme, "system") == 0) {
-        return;
-    }
-
+    /* Single decision point instead of three separate early-returns
+     * partially applying state: gui_theme=="system", a failed
+     * omarchy_theme_load(), and display==NULL now all fall into the same
+     * "revert to system default" branch below, instead of each one
+     * skipping the color-scheme reset and CSS-provider removal
+     * differently. Without this, toggling gui_theme from omarchy to
+     * system (or the active Omarchy theme disappearing) via the live
+     * SIGUSR1 reload never visually reverted. */
+    int use_omarchy = strcasecmp(g_cfg.gui_theme, "system") != 0;
+    GdkDisplay *display = gdk_display_get_default();
     OmarchyThemeColors colors;
-    if (!omarchy_theme_load(&colors)) {
+    int can_apply = use_omarchy && display != NULL && omarchy_theme_load(&colors);
+
+    if (!can_apply) {
+        adw_style_manager_set_color_scheme(adw_style_manager_get_default(), ADW_COLOR_SCHEME_DEFAULT);
+        if (display != NULL && g_theme_css_provider != NULL) {
+            gtk_style_context_remove_provider_for_display(display,
+                                                            GTK_STYLE_PROVIDER(g_theme_css_provider));
+            g_object_unref(g_theme_css_provider);
+            g_theme_css_provider = NULL;
+        }
         return;
     }
 
@@ -276,11 +292,6 @@ static void apply_omarchy_theme(void)
     adw_style_manager_set_color_scheme(style_manager,
                                         colors.is_dark ? ADW_COLOR_SCHEME_FORCE_DARK
                                                         : ADW_COLOR_SCHEME_FORCE_LIGHT);
-
-    GdkDisplay *display = gdk_display_get_default();
-    if (display == NULL) {
-        return;
-    }
 
     if (g_theme_css_provider != NULL) {
         gtk_style_context_remove_provider_for_display(display,
@@ -407,6 +418,14 @@ static void gui_pump_main_context(void *ctx)
 
 static void on_item_activated(GtkListView *list_view, guint position, gpointer user_data)
 {
+    if (g_modal_depth > 0) {
+        /* Re-entrant activation (e.g. Enter fired again while an editor
+         * session or another pumped operation is already in progress) -
+         * every other pumping call site in this file is guarded the same
+         * way. */
+        return;
+    }
+
     GuiPanel *panel = user_data;
     (void)list_view;
     TfmFileItem *item = g_list_model_get_item(G_LIST_MODEL(panel->store), position);
@@ -423,7 +442,14 @@ static void on_item_activated(GtkListView *list_view, guint position, gpointer u
             sizeof(file_path)) {
             show_error_dialog("Error", "Path too long");
         } else {
+            /* Bracketed like every other pumped wait in this file
+             * (shell, fileops, dialogs) - without this, F5-F8/Tab (or
+             * another activation) during the editor session could
+             * copy/move/delete the file out from under the still-open
+             * external editor. */
+            gui_modal_enter();
             int exit_code = editor_open_cb(file_path, gui_pump_main_context, NULL);
+            gui_modal_leave();
             if (exit_code != 0) {
                 char message[64];
                 snprintf(message, sizeof(message), "Editor exited with code %d", exit_code);
@@ -498,7 +524,20 @@ static int gui_is_cd_command(const char *command)
 static void on_shell_entry_activate(GtkEntry *entry, gpointer user_data)
 {
     (void)user_data;
-    const char *command = gtk_editable_get_text(GTK_EDITABLE(entry));
+    if (g_modal_depth > 0) {
+        /* Enter fired again (e.g. key-repeat, or another widget forwarding
+         * activate) while a previous command from this same entry is still
+         * being pumped - without this, it would re-enter a nested nested
+         * pumped wait and double the panel_load() calls below. */
+        return;
+    }
+
+    /* gtk_editable_get_text() returns a pointer owned by the GtkEntry -
+     * shell_execute_cb()/builtin_cd() below pump the main loop, during
+     * which the user can keep typing in this same entry and invalidate
+     * that pointer (use-after-free) or change what it points to (wrong
+     * command/error text). Copy it before doing anything that pumps. */
+    char *command = g_strdup(gtk_editable_get_text(GTK_EDITABLE(entry)));
     GuiPanel *active = &g_panel[g_focused_panel];
 
     if (gui_is_cd_command(command)) {
@@ -533,6 +572,7 @@ static void on_shell_entry_activate(GtkEntry *entry, gpointer user_data)
         }
     }
 
+    g_free(command);
     gtk_editable_set_text(GTK_EDITABLE(entry), "");
 
     panel_load(&g_panel[0], g_panel[0].path);
@@ -766,7 +806,18 @@ static char *prompt_text_dialog(const char *heading, const char *initial_text)
 }
 
 /* fileops.c is UI-independent (see fileops.h) and calls these callbacks
- * on errors/conflicts - the GUI counterpart to tui_fileop_callbacks. */
+ * on errors/conflicts - the GUI counterpart to tui_fileop_callbacks.
+ *
+ * Dialog default-response contract (Enter key / close-attempt), spelled
+ * out explicitly so a future edit doesn't accidentally flip one of these
+ * toward something destructive:
+ *   - error dialog (this function): Enter -> Retry, close -> Abort.
+ *   - overwrite dialog (gui_fileop_on_overwrite): Enter -> Skip,
+ *     close -> Abort.
+ *   - delete confirmation (action_delete): close -> Cancel (see its own
+ *     show_alert_dialog call for the Enter default).
+ * None of these default to the destructive choice (Overwrite/Delete) on
+ * a stray Enter or an accidental window close. */
 static FileOpChoice gui_fileop_on_error(void *ctx, const char *title, const char *message)
 {
     (void)ctx;
@@ -933,9 +984,25 @@ static void action_move(void)
             if (new_name[0] != '\0' && strcmp(new_name, item->name) != 0) {
                 char old_path[PATH_MAX];
                 char new_path[PATH_MAX];
+                struct stat existing_st;
+                int confirmed = 1;
                 if (!path_join(old_path, sizeof(old_path), active->path, item->name) ||
                     !path_join(new_path, sizeof(new_path), active->path, new_name)) {
                     show_error_dialog("Error", "Path too long");
+                    confirmed = 0;
+                } else if (lstat(new_path, &existing_st) == 0) {
+                    /* rename() replaces an existing destination atomically
+                     * and silently - mirror the TUI's F6 rename prompt
+                     * (main.c) instead of losing the existing file. */
+                    if (gui_fileop_on_overwrite(NULL, new_path) != FILEOPS_CHOICE_OVERWRITE) {
+                        confirmed = 0;
+                    }
+                }
+
+                if (!confirmed) {
+                    /* Path-too-long already reported above; a declined
+                     * overwrite is a silent no-op, matching Skip/Abort
+                     * elsewhere. */
                 } else if (rename(old_path, new_path) != 0) {
                     show_error_dialog("Error", strerror(errno));
                 } else {
@@ -1020,7 +1087,16 @@ static void on_function_button_clicked(GtkButton *button, gpointer user_data)
     const char *key = g_object_get_data(G_OBJECT(button), "tfm-key");
     if (strcmp(key, "F10") == 0) {
         g_application_quit(G_APPLICATION(app));
-    } else if (strcmp(key, "F5") == 0) {
+        return;
+    }
+    if (g_modal_depth > 0) {
+        /* Unlike the keyboard controller (:1270) and window-close
+         * (:1360), these mouse clicks had no g_modal_depth guard at all -
+         * a click during an editor session or a pumped fileop could
+         * re-enter copy/move/mkdir/delete on the same file. */
+        return;
+    }
+    if (strcmp(key, "F5") == 0) {
         action_copy();
     } else if (strcmp(key, "F6") == 0) {
         action_move();
@@ -1206,7 +1282,13 @@ static double read_terminal_font_size(void)
         }
     }
     fclose(fp);
-    return size > 0 ? size : 11.0;
+    /* atof() happily returns "inf" for junk/overflow input, which would
+     * otherwise flow straight into generated CSS as e.g. "infpt". Clamp
+     * to a sane font-size range instead of just checking > 0. */
+    if (!isfinite(size) || size < 6.0 || size > 32.0) {
+        return 11.0;
+    }
+    return size;
 }
 
 static double g_font_size = 11.0;

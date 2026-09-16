@@ -5,6 +5,7 @@
 #include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
 
 int path_join(char *out, size_t out_size, const char *dir, const char *name)
@@ -15,19 +16,40 @@ int path_join(char *out, size_t out_size, const char *dir, const char *name)
 
 int builtin_cd(char *current_dir, const char *command, char *error_msg, size_t error_msg_size)
 {
+    /* Public shared helper - don't rely on callers pre-checking, since a
+     * short/non-"cd" command would read command+2 out of bounds. */
+    if (current_dir == NULL || command == NULL || strlen(command) < 2 ||
+        strncmp(command, "cd", 2) != 0) {
+        if (error_msg != NULL) {
+            snprintf(error_msg, error_msg_size, "Not a cd command");
+        }
+        return 0;
+    }
+
     const char *arg = command + 2;
     while (*arg == ' ') {
         arg++;
     }
 
+    /* Checked explicitly (not just left to realpath() to fail on): a
+     * silently truncated raw_path can still be a valid, existing,
+     * completely unrelated directory - realpath() would then happily
+     * resolve and cd into the WRONG place instead of erroring. */
     char raw_path[PATH_MAX];
+    int raw_path_len;
     if (*arg == '\0') {
         const char *home = getenv("HOME");
-        snprintf(raw_path, sizeof(raw_path), "%s", home != NULL ? home : "/");
+        raw_path_len = snprintf(raw_path, sizeof(raw_path), "%s", home != NULL ? home : "/");
     } else if (arg[0] == '/') {
-        snprintf(raw_path, sizeof(raw_path), "%s", arg);
+        raw_path_len = snprintf(raw_path, sizeof(raw_path), "%s", arg);
     } else {
-        snprintf(raw_path, sizeof(raw_path), "%s/%s", current_dir, arg);
+        raw_path_len = snprintf(raw_path, sizeof(raw_path), "%s/%s", current_dir, arg);
+    }
+    if (raw_path_len < 0 || (size_t)raw_path_len >= sizeof(raw_path)) {
+        if (error_msg != NULL) {
+            snprintf(error_msg, error_msg_size, "Path too long");
+        }
+        return 0;
     }
 
     char resolved[PATH_MAX];

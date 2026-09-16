@@ -3,6 +3,7 @@
 #include "dir.h"
 
 #include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,7 +52,13 @@ int dir_list(const char *path, DirEntryInfo **out_entries, size_t *out_count)
     }
 
     struct dirent *entry;
-    while ((entry = readdir(dp)) != NULL) {
+    /* errno reset right before every readdir() call (not just once
+     * before the loop): the loop body's own stat() call for DT_UNKNOWN/
+     * DT_LNK entries can fail (e.g. a dangling symlink) and leave errno
+     * set without that being a real dir_list() failure - resetting only
+     * once would let that stale errno be misattributed to readdir()'s
+     * final, successful EOF return. */
+    while ((errno = 0, entry = readdir(dp)) != NULL) {
         /* Skip "." but keep ".." visible for navigating up. */
         if (strcmp(entry->d_name, ".") == 0) {
             continue;
@@ -85,6 +92,18 @@ int dir_list(const char *path, DirEntryInfo **out_entries, size_t *out_count)
         }
 
         count++;
+    }
+
+    if (errno != 0) {
+        /* readdir() returns NULL both at genuine EOF and on a mid-read
+         * error (EIO on a flaky NFS/FUSE mount, directory removed mid-
+         * iteration) - without the errno check, a real failure silently
+         * looks like "done", returning success with a truncated listing. */
+        free(entries);
+        closedir(dp);
+        *out_entries = NULL;
+        *out_count = 0;
+        return -1;
     }
 
     closedir(dp);

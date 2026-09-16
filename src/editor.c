@@ -27,7 +27,8 @@ int editor_open_cb(const char *path, void (*pump)(void *ctx), void *pump_ctx)
     char quoted[PATH_MAX * 4];
     size_t qi = 0;
     quoted[qi++] = '\'';
-    for (const char *p = path; *p != '\0' && qi < sizeof(quoted) - 5; p++) {
+    const char *p = path;
+    for (; *p != '\0' && qi < sizeof(quoted) - 5; p++) {
         if (*p == '\'') {
             quoted[qi++] = '\'';
             quoted[qi++] = '\\';
@@ -36,6 +37,11 @@ int editor_open_cb(const char *path, void (*pump)(void *ctx), void *pump_ctx)
         } else {
             quoted[qi++] = *p;
         }
+    }
+    if (*p != '\0') {
+        /* Buffer ran out before path did - continuing would silently
+         * open a truncated, different path. */
+        return -1;
     }
     quoted[qi++] = '\'';
     quoted[qi] = '\0';

@@ -2,11 +2,13 @@
 
 #include "config.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 /* Default list used when tfm.ini has no (or an empty) [editor] section. */
 #define DEFAULT_EDITOR_EXTENSIONS \
@@ -15,20 +17,28 @@
 #define CONFIG_DIR_NAME ".tfm"
 #define CONFIG_FILE_NAME "tfm.ini"
 
-static void config_get_dir(char *buf, size_t len)
+/* Returns 1 on success, 0 if the result was truncated (e.g. $HOME sitting
+ * right up against PATH_MAX, leaving no room for "/.tfm") - checked
+ * explicitly rather than left to silently produce a shorter path that
+ * could point at a different, existing location. */
+static int config_get_dir(char *buf, size_t len)
 {
     const char *home = getenv("HOME");
     if (home == NULL) {
         home = ".";
     }
-    snprintf(buf, len, "%s/%s", home, CONFIG_DIR_NAME);
+    int n = snprintf(buf, len, "%s/%s", home, CONFIG_DIR_NAME);
+    return n > 0 && (size_t)n < len;
 }
 
-static void config_get_path(char *buf, size_t len)
+static int config_get_path(char *buf, size_t len)
 {
     char dir[PATH_MAX];
-    config_get_dir(dir, sizeof(dir));
-    snprintf(buf, len, "%s/%s", dir, CONFIG_FILE_NAME);
+    if (!config_get_dir(dir, sizeof(dir))) {
+        return 0;
+    }
+    int n = snprintf(buf, len, "%s/%s", dir, CONFIG_FILE_NAME);
+    return n > 0 && (size_t)n < len;
 }
 
 void config_set_defaults(Config *cfg)
@@ -69,7 +79,9 @@ void config_load(Config *cfg)
     config_set_defaults(cfg);
 
     char path[PATH_MAX];
-    config_get_path(path, sizeof(path));
+    if (!config_get_path(path, sizeof(path))) {
+        return;
+    }
 
     FILE *fp = fopen(path, "r");
     if (fp == NULL) {
@@ -144,23 +156,43 @@ void config_load(Config *cfg)
 void config_save(const Config *cfg)
 {
     char dir[PATH_MAX];
-    config_get_dir(dir, sizeof(dir));
-    mkdir(dir, 0755);
+    if (!config_get_dir(dir, sizeof(dir))) {
+        return;
+    }
+    if (mkdir(dir, 0755) != 0 && errno != EEXIST) {
+        return;
+    }
 
     char path[PATH_MAX];
-    config_get_path(path, sizeof(path));
+    if (!config_get_path(path, sizeof(path))) {
+        return;
+    }
 
     /* Write to a temp file and rename() over the real one atomically on
      * success; writing directly to tfm.ini could leave it truncated or
-     * half-written on a disk-full/write error. */
+     * half-written on a disk-full/write error.
+     *
+     * mkstemp(), not a fixed "%s.tmp" + fopen("w"): a predictable tmp
+     * path lets an attacker pre-plant a symlink there and have it
+     * silently followed and truncated. mkstemp() picks a random name and
+     * creates it atomically (O_CREAT|O_EXCL); fchmod(0600) keeps the
+     * saved paths private regardless of umask. */
     char tmp_path[PATH_MAX];
-    int n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+    int n = snprintf(tmp_path, sizeof(tmp_path), "%s.XXXXXX", path);
     if (n <= 0 || (size_t)n >= sizeof(tmp_path)) {
         return;
     }
 
-    FILE *fp = fopen(tmp_path, "w");
+    int fd = mkstemp(tmp_path);
+    if (fd == -1) {
+        return;
+    }
+    fchmod(fd, 0600);
+
+    FILE *fp = fdopen(fd, "w");
     if (fp == NULL) {
+        close(fd);
+        remove(tmp_path);
         return;
     }
 
@@ -182,11 +214,10 @@ void config_save(const Config *cfg)
         ok = 0;
     }
 
-    if (ok) {
-        rename(tmp_path, path);
-    } else {
-        remove(tmp_path);
+    if (ok && rename(tmp_path, path) == 0) {
+        return;
     }
+    remove(tmp_path);
 }
 
 int config_is_editor_extension(const Config *cfg, const char *filename)

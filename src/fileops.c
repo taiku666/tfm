@@ -102,10 +102,11 @@ static long long compute_total_size(const char *path, const FileOpCallbacks *cb)
 static int remove_existing_for_overwrite(const char *dest, const struct stat *dest_st,
                                           const FileOpCallbacks *cb);
 
-/* Copies a single file. Returns 1 on success or if the user skipped it,
- * 0 if the operation should abort. */
+/* Copies a single file. Returns 1 on success or Skip (setting *had_skip
+ * on Skip), 0 on Abort. had_skip lets move() tell "fully copied" apart
+ * from "partially skipped", so it never deletes a skipped source file. */
 static int copy_file(const char *src_path, const char *dest_path, CopyProgress *progress,
-                      const FileOpCallbacks *cb)
+                      const FileOpCallbacks *cb, int *had_skip)
 {
     if (strcmp(src_path, dest_path) == 0) {
         for (;;) {
@@ -113,7 +114,11 @@ static int copy_file(const char *src_path, const char *dest_path, CopyProgress *
             if (choice == FILEOPS_CHOICE_RETRY) {
                 continue;
             }
-            return choice == FILEOPS_CHOICE_SKIP;
+            if (choice == FILEOPS_CHOICE_SKIP) {
+                *had_skip = 1;
+                return 1;
+            }
+            return 0;
         }
     }
 
@@ -136,7 +141,11 @@ static int copy_file(const char *src_path, const char *dest_path, CopyProgress *
                     if (choice == FILEOPS_CHOICE_RETRY) {
                         continue;
                     }
-                    return choice == FILEOPS_CHOICE_SKIP;
+                    if (choice == FILEOPS_CHOICE_SKIP) {
+                        *had_skip = 1;
+                        return 1;
+                    }
+                    return 0;
                 }
             }
         }
@@ -147,7 +156,11 @@ static int copy_file(const char *src_path, const char *dest_path, CopyProgress *
              * value (including an unexpected one from a buggy UI
              * callback, since this enum is shared with on_error) aborts
              * or skips rather than silently overwriting. */
-            return choice == FILEOPS_CHOICE_SKIP;
+            if (choice == FILEOPS_CHOICE_SKIP) {
+                *had_skip = 1;
+                return 1;
+            }
+            return 0;
         }
         /* Remove the existing entry. If it's a directory, unlink() would
          * fail (EISDIR) and fall through to O_EXCL failing EEXIST,
@@ -180,24 +193,47 @@ static int copy_file(const char *src_path, const char *dest_path, CopyProgress *
             if (choice == FILEOPS_CHOICE_RETRY) {
                 continue;
             }
-            return choice == FILEOPS_CHOICE_SKIP;
+            if (choice == FILEOPS_CHOICE_SKIP) {
+                *had_skip = 1;
+                return 1;
+            }
+            return 0;
         }
 
-        int open_flags = O_WRONLY | O_CREAT | (dest_created ? O_TRUNC : O_EXCL);
+        /* O_NOFOLLOW on every attempt, not just the first O_EXCL create:
+         * a symlink planted at dest_path during the error/overwrite
+         * prompt (TOCTOU) would otherwise be followed and its target
+         * truncated by a Retry's O_TRUNC open. */
+        int open_flags = O_WRONLY | O_CREAT | O_NOFOLLOW | (dest_created ? O_TRUNC : O_EXCL);
         int dest_fd = open(dest_path, open_flags, 0666);
         FILE *out = (dest_fd != -1) ? fdopen(dest_fd, "wb") : NULL;
         if (out == NULL) {
             if (dest_fd != -1) {
+                /* open() succeeded but fdopen() failed - the file exists
+                 * (freshly created or truncated) but is now an orphaned
+                 * empty file. Remove it and reset dest_created so a Retry
+                 * uses O_EXCL again instead of hitting EEXIST forever. */
                 close(dest_fd);
+                unlink(dest_path);
+                dest_created = 0;
             }
             fclose(in);
             FileOpChoice choice = report_error(cb, "Error writing", dest_path);
             if (choice == FILEOPS_CHOICE_RETRY) {
                 continue;
             }
-            return choice == FILEOPS_CHOICE_SKIP;
+            if (choice == FILEOPS_CHOICE_SKIP) {
+                *had_skip = 1;
+                return 1;
+            }
+            return 0;
         }
         dest_created = 1;
+
+        /* Snapshot copied_bytes so a Retry after a mid-file failure
+         * restores it instead of double-counting this file's bytes
+         * (the retry starts the file over from byte 0). */
+        long long bytes_before_attempt = progress->copied_bytes;
 
         int failed = 0;
         char buffer[65536];
@@ -215,27 +251,47 @@ static int copy_file(const char *src_path, const char *dest_path, CopyProgress *
                 progress->last_reported_percent = percent_int;
             }
         }
+        if (!failed && ferror(in)) {
+            /* fread() returning 0 means either clean EOF or a read
+             * error (e.g. EIO on a flaky mount) - without this check a
+             * mid-copy I/O error looks identical to a successful,
+             * complete copy. */
+            failed = 1;
+        }
 
         if (!failed) {
             /* Preserve the source's permissions instead of the process
              * default (open() with 0666 & ~umask): otherwise a copied
              * executable loses its x-bit, or a private 0600 file (e.g. an
-             * SSH key) ends up 0644 (world-readable) under a typical umask. */
+             * SSH key) ends up 0644 (world-readable) under a typical
+             * umask. Masked to 0777 (not 07777): setuid/setgid on a
+             * regular file must never be carried over to a copy made by
+             * a different, possibly unprivileged, owner. */
             struct stat src_mode_st;
             if (stat(src_path, &src_mode_st) == 0) {
-                fchmod(fileno(out), src_mode_st.st_mode & 07777);
+                fchmod(fileno(out), src_mode_st.st_mode & 0777);
             }
         }
 
-        fclose(in);
-        fclose(out);
+        int in_close_failed = fclose(in) != 0;
+        int out_close_failed = fclose(out) != 0;
+        if (in_close_failed || out_close_failed) {
+            /* A buffered write error (e.g. ENOSPC) can surface only at
+             * fclose(), after every fwrite() appeared to succeed. */
+            failed = 1;
+        }
 
         if (failed) {
+            progress->copied_bytes = bytes_before_attempt;
             FileOpChoice choice = report_error(cb, "Error writing", dest_path);
             if (choice == FILEOPS_CHOICE_RETRY) {
                 continue;
             }
-            return choice == FILEOPS_CHOICE_SKIP;
+            if (choice == FILEOPS_CHOICE_SKIP) {
+                *had_skip = 1;
+                return 1;
+            }
+            return 0;
         }
 
         return 1;
@@ -257,14 +313,32 @@ static int remove_existing_for_overwrite(const char *dest, const struct stat *de
     if (S_ISDIR(dest_st->st_mode)) {
         return delete_recursive(dest, cb);
     }
-    unlink(dest);
-    return 1;
+    for (;;) {
+        if (unlink(dest) == 0) {
+            return 1;
+        }
+        /* An ignored unlink() failure (e.g. EPERM on an immutable file)
+         * used to fall through silently: the caller's subsequent
+         * O_EXCL/mkdir create would then fail EEXIST against the entry
+         * that was never actually removed, and Retry would just hit the
+         * same silent unlink() failure again - an infinite dialog loop
+         * with no indication of the real cause. Skip has no well-defined
+         * meaning at this layer (the caller already committed to
+         * overwriting), so it's treated the same as Abort: stop this
+         * entry rather than silently proceeding as if it were removed. */
+        FileOpChoice choice = report_error(cb, "Cannot remove", dest);
+        if (choice == FILEOPS_CHOICE_RETRY) {
+            continue;
+        }
+        return 0;
+    }
 }
 
 /* Copies src (file or directory) recursively to dest. Returns 1 to
- * continue, 0 if aborted. */
+ * continue, 0 if aborted. See copy_file()'s comment for what had_skip is
+ * for and why every SKIP exit below sets it instead of just returning 1. */
 static int copy_recursive(const char *src, const char *dest, CopyProgress *progress,
-                           const FileOpCallbacks *cb)
+                           const FileOpCallbacks *cb, int *had_skip)
 {
     struct stat st;
     /* lstat, not stat: handle symlinks themselves (copy as a link) rather
@@ -278,7 +352,11 @@ static int copy_recursive(const char *src, const char *dest, CopyProgress *progr
         if (choice == FILEOPS_CHOICE_RETRY) {
             continue;
         }
-        return choice == FILEOPS_CHOICE_SKIP;
+        if (choice == FILEOPS_CHOICE_SKIP) {
+            *had_skip = 1;
+            return 1;
+        }
+        return 0;
     }
 
     if (S_ISLNK(st.st_mode)) {
@@ -286,14 +364,33 @@ static int copy_recursive(const char *src, const char *dest, CopyProgress *progr
         ssize_t len;
         for (;;) {
             len = readlink(src, target, sizeof(target) - 1);
-            if (len >= 0) {
-                break;
+            if (len < 0) {
+                FileOpChoice choice = report_error(cb, "Error reading link", src);
+                if (choice == FILEOPS_CHOICE_RETRY) {
+                    continue;
+                }
+                if (choice == FILEOPS_CHOICE_SKIP) {
+                    *had_skip = 1;
+                    return 1;
+                }
+                return 0;
             }
-            FileOpChoice choice = report_error(cb, "Error reading link", src);
-            if (choice == FILEOPS_CHOICE_RETRY) {
-                continue;
+            if ((size_t)len == sizeof(target) - 1) {
+                /* readlink() truncates silently on overflow: no NUL
+                 * termination, no truncation indicator in the return
+                 * value, just a full buffer. Continuing would symlink()
+                 * a truncated, wrong target with no error at all. */
+                FileOpChoice choice = report_error(cb, "Error reading link", "Link target too long");
+                if (choice == FILEOPS_CHOICE_RETRY) {
+                    continue;
+                }
+                if (choice == FILEOPS_CHOICE_SKIP) {
+                    *had_skip = 1;
+                    return 1;
+                }
+                return 0;
             }
-            return choice == FILEOPS_CHOICE_SKIP;
+            break;
         }
         target[len] = '\0';
 
@@ -305,7 +402,11 @@ static int copy_recursive(const char *src, const char *dest, CopyProgress *progr
              * skipped/overwritten/aborted rather than just erroring out. */
             FileOpChoice choice = report_overwrite(cb, dest);
             if (choice != FILEOPS_CHOICE_OVERWRITE) {
-                return choice == FILEOPS_CHOICE_SKIP;
+                if (choice == FILEOPS_CHOICE_SKIP) {
+                    *had_skip = 1;
+                    return 1;
+                }
+                return 0;
             }
             if (!remove_existing_for_overwrite(dest, &dest_existing, cb)) {
                 return 0;
@@ -320,12 +421,27 @@ static int copy_recursive(const char *src, const char *dest, CopyProgress *progr
             if (choice == FILEOPS_CHOICE_RETRY) {
                 continue;
             }
-            return choice == FILEOPS_CHOICE_SKIP;
+            if (choice == FILEOPS_CHOICE_SKIP) {
+                *had_skip = 1;
+                return 1;
+            }
+            return 0;
         }
     }
 
     if (!S_ISDIR(st.st_mode)) {
-        return copy_file(src, dest, progress, cb);
+        if (!S_ISREG(st.st_mode)) {
+            /* FIFO/socket/device: fopen()ing one of these blocks or
+             * copies forever instead of erroring, since copy_file()
+             * assumes an ordinary file. */
+            FileOpChoice choice = report_error(cb, "Cannot copy", "Not a regular file or directory");
+            if (choice == FILEOPS_CHOICE_SKIP) {
+                *had_skip = 1;
+                return 1;
+            }
+            return 0;
+        }
+        return copy_file(src, dest, progress, cb, had_skip);
     }
 
     for (;;) {
@@ -359,16 +475,40 @@ static int copy_recursive(const char *src, const char *dest, CopyProgress *progr
              * now handled like any other conflict. */
             FileOpChoice choice = report_overwrite(cb, dest);
             if (choice != FILEOPS_CHOICE_OVERWRITE) {
-                return choice == FILEOPS_CHOICE_SKIP;
+                if (choice == FILEOPS_CHOICE_SKIP) {
+                    *had_skip = 1;
+                    return 1;
+                }
+                return 0;
             }
-            unlink(dest);
+            if (unlink(dest) != 0) {
+                /* Without checking this, a persistent removal failure
+                 * (e.g. EPERM) would just re-hit EEXIST and re-ask
+                 * "overwrite?" for an entry that already answered
+                 * OVERWRITE and still can't actually be removed -
+                 * looping the same prompt instead of surfacing the real
+                 * cause. */
+                FileOpChoice remove_choice = report_error(cb, "Cannot remove", dest);
+                if (remove_choice == FILEOPS_CHOICE_RETRY) {
+                    continue;
+                }
+                if (remove_choice == FILEOPS_CHOICE_SKIP) {
+                    *had_skip = 1;
+                    return 1;
+                }
+                return 0;
+            }
             continue;
         }
         FileOpChoice choice = report_error(cb, "Cannot create directory", dest);
         if (choice == FILEOPS_CHOICE_RETRY) {
             continue;
         }
-        return choice == FILEOPS_CHOICE_SKIP;
+        if (choice == FILEOPS_CHOICE_SKIP) {
+            *had_skip = 1;
+            return 1;
+        }
+        return 0;
     }
 
     DIR *dp;
@@ -381,31 +521,63 @@ static int copy_recursive(const char *src, const char *dest, CopyProgress *progr
         if (choice == FILEOPS_CHOICE_RETRY) {
             continue;
         }
-        return choice == FILEOPS_CHOICE_SKIP;
+        if (choice == FILEOPS_CHOICE_SKIP) {
+            *had_skip = 1;
+            return 1;
+        }
+        return 0;
     }
 
     struct dirent *entry;
-    while ((entry = readdir(dp)) != NULL) {
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-            continue;
-        }
-
-        char child_src[PATH_MAX];
-        char child_dest[PATH_MAX];
-        if (!path_join(child_src, sizeof(child_src), src, entry->d_name) ||
-            !path_join(child_dest, sizeof(child_dest), dest, entry->d_name)) {
-            FileOpChoice choice = report_error(cb, "Path too long", entry->d_name);
-            if (choice == FILEOPS_CHOICE_SKIP) {
+    for (;;) {
+        /* errno reset right before every readdir() call: the loop body
+         * recurses into copy_recursive() for subdirectories, which runs
+         * plenty of its own syscalls that can leave errno set without
+         * that being a real failure of THIS readdir() - resetting only
+         * once before the loop would misattribute that stale errno to
+         * this loop's own, successful EOF return. */
+        while ((errno = 0, entry = readdir(dp)) != NULL) {
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
                 continue;
             }
-            closedir(dp);
-            return 0;
+
+            char child_src[PATH_MAX];
+            char child_dest[PATH_MAX];
+            if (!path_join(child_src, sizeof(child_src), src, entry->d_name) ||
+                !path_join(child_dest, sizeof(child_dest), dest, entry->d_name)) {
+                FileOpChoice choice = report_error(cb, "Path too long", entry->d_name);
+                if (choice == FILEOPS_CHOICE_SKIP) {
+                    *had_skip = 1;
+                    continue;
+                }
+                closedir(dp);
+                return 0;
+            }
+
+            if (!copy_recursive(child_src, child_dest, progress, cb, had_skip)) {
+                closedir(dp);
+                return 0;
+            }
         }
 
-        if (!copy_recursive(child_src, child_dest, progress, cb)) {
-            closedir(dp);
-            return 0;
+        if (errno == 0) {
+            break;
         }
+        /* readdir() returning NULL means EOF or error alike - without
+         * this check, a mid-read failure (EIO on a flaky mount) silently
+         * looks like "done copying this directory", leaving entries
+         * added to the source after the failure point uncopied with no
+         * indication anything went wrong. */
+        FileOpChoice choice = report_error(cb, "Error reading", src);
+        if (choice == FILEOPS_CHOICE_RETRY) {
+            continue;
+        }
+        if (choice == FILEOPS_CHOICE_SKIP) {
+            *had_skip = 1;
+            break;
+        }
+        closedir(dp);
+        return 0;
     }
 
     closedir(dp);
@@ -421,11 +593,38 @@ static int copy_recursive(const char *src, const char *dest, CopyProgress *progr
  * comparison data-loss guard covers the rest. */
 static int dir_is_or_contains(const char *dir, const char *src)
 {
-    char real_dir[PATH_MAX];
     char real_src[PATH_MAX];
-    if (realpath(dir, real_dir) == NULL || realpath(src, real_src) == NULL) {
+    if (realpath(src, real_src) == NULL) {
         return 0;
     }
+
+    /* dir (the destination) may not exist yet - e.g. copying src into a
+     * not-yet-created subdirectory of itself - so realpath(dir) failing
+     * used to be treated as "not contained", bypassing this guard for
+     * exactly the case it exists to catch. Walk up to the nearest
+     * existing ancestor of dir instead: if that ancestor already lies
+     * under src, every not-yet-created descendant mkdir() would create
+     * under it does too. */
+    char probe[PATH_MAX];
+    if ((size_t)snprintf(probe, sizeof(probe), "%s", dir) >= sizeof(probe)) {
+        return 0;
+    }
+
+    char real_dir[PATH_MAX];
+    for (;;) {
+        if (realpath(probe, real_dir) != NULL) {
+            break;
+        }
+        char *slash = strrchr(probe, '/');
+        if (slash == NULL || slash == probe) {
+            /* Ran out of ancestors to try and still couldn't resolve -
+             * fail closed (treat as contained, blocking the copy)
+             * rather than silently bypassing the guard on uncertainty. */
+            return 1;
+        }
+        *slash = '\0';
+    }
+
     size_t src_len = strlen(real_src);
     if (strncmp(real_dir, real_src, src_len) != 0) {
         return 0;
@@ -446,8 +645,23 @@ static void strip_trailing_slashes(char *path)
     }
 }
 
+/* True for a path with no safe basename to operate on: NULL, empty, "/",
+ * ".", or "..". Without this, fileops_copy("/", dest, cb) computes an
+ * empty base and the EEXIST merge path silently copies the entire
+ * filesystem into dest; fileops_delete("/", cb) had no guard at all. */
+static int is_unsafe_root_path(const char *path)
+{
+    return path == NULL || path[0] == '\0' || strcmp(path, "/") == 0 ||
+           strcmp(path, ".") == 0 || strcmp(path, "..") == 0;
+}
+
 void fileops_copy(const char *src, const char *dest_dir, const FileOpCallbacks *cb)
 {
+    if (is_unsafe_root_path(src)) {
+        report_error(cb, "Error", "Refusing to copy this path");
+        return;
+    }
+
     char normalized_src[PATH_MAX];
     /* Unlike path_join() elsewhere in this file, a truncated src here
      * can't just be caught by the caller re-checking dest - it would
@@ -463,6 +677,13 @@ void fileops_copy(const char *src, const char *dest_dir, const FileOpCallbacks *
 
     const char *base = strrchr(src, '/');
     base = (base != NULL) ? base + 1 : src;
+
+    if (base[0] == '\0') {
+        /* Catches a src that only becomes "/" after normalization
+         * (e.g. "//"), which slips past is_unsafe_root_path() above. */
+        report_error(cb, "Error", "Refusing to copy this path");
+        return;
+    }
 
     struct stat src_top_st;
     if (lstat(src, &src_top_st) == 0 && S_ISDIR(src_top_st.st_mode) &&
@@ -489,7 +710,8 @@ void fileops_copy(const char *src, const char *dest_dir, const FileOpCallbacks *
 
     report_progress(cb, "Copying...", src, 0.0);
 
-    copy_recursive(src, dest, &progress, cb);
+    int had_skip = 0;
+    copy_recursive(src, dest, &progress, cb, &had_skip);
 }
 
 /* Deletes path recursively, with error handling (skip/retry/abort)
@@ -525,23 +747,46 @@ static int delete_recursive(const char *path, const FileOpCallbacks *cb)
         }
 
         struct dirent *entry;
-        while ((entry = readdir(dp)) != NULL) {
-            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-                continue;
-            }
-            char child[PATH_MAX];
-            if (!path_join(child, sizeof(child), path, entry->d_name)) {
-                FileOpChoice choice = report_error(cb, "Path too long", entry->d_name);
-                if (choice == FILEOPS_CHOICE_SKIP) {
+        for (;;) {
+            /* See the matching comment in copy_recursive(): reset right
+             * before every readdir() call, not just once, since the
+             * loop body recurses into delete_recursive(). */
+            while ((errno = 0, entry = readdir(dp)) != NULL) {
+                if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
                     continue;
                 }
-                closedir(dp);
-                return 0;
+                char child[PATH_MAX];
+                if (!path_join(child, sizeof(child), path, entry->d_name)) {
+                    FileOpChoice choice = report_error(cb, "Path too long", entry->d_name);
+                    if (choice == FILEOPS_CHOICE_SKIP) {
+                        continue;
+                    }
+                    closedir(dp);
+                    return 0;
+                }
+                if (!delete_recursive(child, cb)) {
+                    closedir(dp);
+                    return 0;
+                }
             }
-            if (!delete_recursive(child, cb)) {
-                closedir(dp);
-                return 0;
+
+            if (errno == 0) {
+                break;
             }
+            /* Without this check, a mid-read readdir() failure (EIO on a
+             * flaky mount) silently looks like "directory fully
+             * enumerated", leaving unprocessed entries behind - the
+             * subsequent rmdir() below would then just fail ENOTEMPTY
+             * with no indication why. */
+            FileOpChoice choice = report_error(cb, "Error reading", path);
+            if (choice == FILEOPS_CHOICE_RETRY) {
+                continue;
+            }
+            if (choice == FILEOPS_CHOICE_SKIP) {
+                break;
+            }
+            closedir(dp);
+            return 0;
         }
         closedir(dp);
 
@@ -571,6 +816,11 @@ static int delete_recursive(const char *path, const FileOpCallbacks *cb)
 
 void fileops_move(const char *src, const char *dest_dir, const FileOpCallbacks *cb)
 {
+    if (is_unsafe_root_path(src)) {
+        report_error(cb, "Error", "Refusing to move this path");
+        return;
+    }
+
     char normalized_src[PATH_MAX];
     /* See the matching check in fileops_copy(): a truncated src here would
      * silently operate on a different, shorter path than the one passed
@@ -585,6 +835,12 @@ void fileops_move(const char *src, const char *dest_dir, const FileOpCallbacks *
 
     const char *base = strrchr(src, '/');
     base = (base != NULL) ? base + 1 : src;
+
+    if (base[0] == '\0') {
+        /* See the matching check in fileops_copy(). */
+        report_error(cb, "Error", "Refusing to move this path");
+        return;
+    }
 
     struct stat src_top_st;
     if (lstat(src, &src_top_st) == 0 && S_ISDIR(src_top_st.st_mode) &&
@@ -648,8 +904,19 @@ void fileops_move(const char *src, const char *dest_dir, const FileOpCallbacks *
 
             report_progress(cb, "Moving...", src, 0.0);
 
-            if (copy_recursive(src, dest, &progress, cb)) {
-                delete_recursive(src, cb);
+            int had_skip = 0;
+            if (copy_recursive(src, dest, &progress, cb, &had_skip)) {
+                if (had_skip) {
+                    /* At least one entry was Skipped rather than actually
+                     * copied - deleting the source here would destroy
+                     * exactly the files the user chose to keep. Leave the
+                     * whole source tree in place instead of guessing which
+                     * parts are now safe to remove. */
+                    report_error(cb, "Move incomplete",
+                                 "Some files were skipped and were not moved; source left in place.");
+                } else {
+                    delete_recursive(src, cb);
+                }
             }
             return;
         }
@@ -681,12 +948,24 @@ void fileops_move(const char *src, const char *dest_dir, const FileOpCallbacks *
 
     report_progress(cb, "Moving...", src, 0.0);
 
-    if (copy_recursive(src, dest, &progress, cb)) {
-        delete_recursive(src, cb);
+    int had_skip = 0;
+    if (copy_recursive(src, dest, &progress, cb, &had_skip)) {
+        if (had_skip) {
+            /* See the same guard in the dir-merge branch above: don't
+             * delete source entries that were never actually copied. */
+            report_error(cb, "Move incomplete",
+                         "Some files were skipped and were not moved; source left in place.");
+        } else {
+            delete_recursive(src, cb);
+        }
     }
 }
 
 void fileops_delete(const char *path, const FileOpCallbacks *cb)
 {
+    if (is_unsafe_root_path(path)) {
+        report_error(cb, "Error", "Refusing to delete this path");
+        return;
+    }
     delete_recursive(path, cb);
 }

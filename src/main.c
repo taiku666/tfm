@@ -184,16 +184,21 @@ static const FileOpCallbacks tui_fileop_callbacks = {
     .ctx = NULL,
 };
 
-/* atexit() handlers (raw mode/alt screen/cursor restore) only run on
- * normal exit, not on termination by signal (SIGTERM/SIGHUP/kill), which
- * would otherwise leave the terminal stuck in raw mode. exit() also runs
- * atexit handlers, so we call it here; it's technically not
- * async-signal-safe, but in this single-threaded app that risk is far
- * smaller than the guaranteed broken terminal from doing nothing. */
+/* Set by the terminating-signal handler below; checked at the top of the
+ * main loop so shutdown goes through the normal exit path (atexit
+ * handlers AND config_save()) instead of calling exit()/config_save()
+ * directly from a signal handler, which isn't async-signal-safe
+ * (config_save() calls fopen/fprintf/fclose). sig_atomic_t + volatile is
+ * the one type POSIX guarantees is safe to write from a handler and read
+ * from normal code. No SA_RESTART on these handlers, so the blocking
+ * read() in input_read_key() is interrupted (EINTR) and control returns
+ * to the main loop promptly instead of waiting for the next keypress. */
+static volatile sig_atomic_t g_shutdown_requested = 0;
+
 static void handle_terminating_signal(int signum)
 {
     (void)signum;
-    exit(1);
+    g_shutdown_requested = 1;
 }
 
 static void install_terminating_signal_handlers(void)
@@ -206,6 +211,16 @@ static void install_terminating_signal_handlers(void)
     sigaction(SIGTERM, &action, NULL);
     sigaction(SIGHUP, &action, NULL);
     sigaction(SIGQUIT, &action, NULL);
+    /* SIGINT: with ISIG cleared in raw mode (input.c), Ctrl-C arrives as
+     * ordinary KEY_CHAR data, not this signal - but `kill -INT <pid>`
+     * from outside the terminal still sends a real SIGINT, which
+     * previously bypassed all cleanup (stuck raw mode/alt-screen/hidden
+     * cursor). */
+    sigaction(SIGINT, &action, NULL);
+    /* SIGPIPE: default action is to kill the process; writing to a
+     * closed pipe (e.g. stdout piped into a reader that exits early)
+     * would otherwise terminate tfm with no cleanup at all. */
+    signal(SIGPIPE, SIG_IGN);
 }
 
 int main(void)
@@ -214,6 +229,12 @@ int main(void)
 
     screen_enter_alt_screen();
     atexit(screen_leave_alt_screen);
+    /* Registered before splash_show() (not after, as before) - the
+     * splash hides the cursor itself and only restores it at the end of
+     * its ~2.5s animation, so a SIGTERM/SIGHUP/SIGQUIT during that
+     * window needs this atexit handler already registered to avoid
+     * exiting with the cursor left hidden. */
+    atexit(screen_show_cursor);
 
     splash_show("TFM", "Taiku File Manager");
 
@@ -249,7 +270,6 @@ int main(void)
     size_t cmd_len = 0;
 
     input_enable_raw_mode();
-    atexit(screen_show_cursor);
 
     redraw_ui(&cfg, &panel_left, &panel_right, focus, cmd_buffer);
 
@@ -297,7 +317,20 @@ int main(void)
 
     int running = 1;
     while (running) {
+        /* Checked before the blocking read, not just after: if the
+         * signal arrived before this loop was ever reached (e.g. during
+         * splash/config load), there's no longer a pending signal left
+         * to interrupt input_read_key()'s read() - it would otherwise
+         * block indefinitely waiting for a keypress that never comes. */
+        if (g_shutdown_requested) {
+            break;
+        }
+
         KeyEvent key = input_read_key();
+
+        if (g_shutdown_requested) {
+            break;
+        }
 
         if (input_consume_resize_flag()) {
             redraw_ui(&cfg, &panel_left, &panel_right, focus, cmd_buffer);

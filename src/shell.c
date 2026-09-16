@@ -21,8 +21,14 @@ int shell_execute_cb(const char *command, const char *cwd, void (*pump)(void *ct
     }
 
     if (pid == 0) {
+        /* Distinct exit codes so the caller (and shell_execute_cb()'s own
+         * WIFEXITED/WEXITSTATUS translation below) can tell "couldn't set
+         * up the child" apart from "the invoked command genuinely exited
+         * 127" - both used to _exit(127), making them indistinguishable.
+         * 126/127 follow the same convention POSIX shells use
+         * ("cannot execute" vs "command not found"). */
         if (chdir(cwd) != 0) {
-            _exit(127);
+            _exit(126);
         }
         execl("/bin/sh", "sh", "-c", command, (char *)NULL);
         _exit(127); /* only reached if execl failed */
@@ -62,6 +68,13 @@ int shell_execute_cb(const char *command, const char *cwd, void (*pump)(void *ct
 
     if (WIFEXITED(status)) {
         return WEXITSTATUS(status);
+    }
+    if (WIFSIGNALED(status)) {
+        /* 128+signal (the same convention shells use for $?) instead of
+         * -1: -1 previously meant both "killed by a signal" and "fork()/
+         * waitpid() itself failed", two very different situations a
+         * caller might want to react to differently. */
+        return 128 + WTERMSIG(status);
     }
     return -1;
 }
