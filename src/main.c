@@ -81,7 +81,7 @@ static void redraw_ui(const Config *cfg, const Panel *left, const Panel *right, 
     theme.icons_enabled = strcasecmp(cfg->icons, "omarchy") == 0;
 
     static const FunctionKey FUNCTION_KEYS[] = {
-        {"F5", "Copy"}, {"F6", "Move"}, {"F7", "Mkdir"}, {"F8", "Delete"}, {"F10", "Quit"},
+        {"F5", "Copy"}, {"F6", "Move"}, {"F7", "Mkdir"}, {"F8", "Delete"}, {"F9", "Undo"}, {"F10", "Quit"},
     };
 
     screen_clear();
@@ -528,19 +528,31 @@ int main(int argc, char *argv[])
             if (active_panel->count > 0) {
                 const DirEntryInfo *entry = &active_panel->entries[active_panel->selected_index];
                 if (strcmp(entry->name, "..") != 0) {
+                    /* Shift+F8 bypasses the trash (below) for a real,
+                     * permanent delete - e.g. for a large file not worth
+                     * doubling disk usage for, or sensitive data that
+                     * shouldn't linger in ~/.local/share/Trash. */
+                    int permanent = key.shift;
+
                     char confirm_msg[TUI_MSG_BUFFER_SIZE];
-                    snprintf(confirm_msg, sizeof(confirm_msg), "Delete %s%s?", entry->name,
+                    snprintf(confirm_msg, sizeof(confirm_msg), "%s%s%s?",
+                             permanent ? "Permanently delete " : "Delete ", entry->name,
                              entry->is_dir ? "/" : "");
 
                     screen_hide_cursor();
-                    int confirmed = screen_prompt_confirm("Delete", confirm_msg);
+                    int confirmed = screen_prompt_confirm(permanent ? "Permanently delete" : "Delete",
+                                                           confirm_msg);
 
                     if (confirmed) {
                         char target_path[PATH_MAX];
                         if (!path_join(target_path, sizeof(target_path), active_panel->path, entry->name)) {
                             tui_show_popup("Error", "Path too long");
                         } else {
-                            fileops_delete(target_path, &tui_fileop_callbacks);
+                            if (permanent) {
+                                fileops_delete(target_path, &tui_fileop_callbacks);
+                            } else {
+                                fileops_trash(target_path, &tui_fileop_callbacks);
+                            }
                             /* See comment at F5/fileops_copy(). */
                             input_consume_resize_flag();
 
@@ -554,6 +566,28 @@ int main(int argc, char *argv[])
                 }
             }
 
+            redraw_ui(&cfg, &panel_left, &panel_right, focus, cmd_buffer);
+        } else if (key.type == KEY_F9) {
+            /* Undo: restores the single most-recently-trashed item (see
+             * fileops_restore_last_trashed()) - not a general undo of
+             * copy/move, and not a trash browser; only ever the most
+             * recent delete. Reloads both panels unconditionally since
+             * the restored item's original directory may be either one,
+             * or neither (if the user has since navigated away). */
+            char restored_path[PATH_MAX] = "";
+            if (fileops_restore_last_trashed(&tui_fileop_callbacks, restored_path,
+                                              sizeof(restored_path))) {
+                /* Sized for the full restored_path (PATH_MAX), not
+                 * TUI_MSG_BUFFER_SIZE - that's for short, bounded
+                 * messages elsewhere in this file; a restored path can
+                 * legitimately be close to PATH_MAX itself. */
+                char msg[PATH_MAX + 32];
+                snprintf(msg, sizeof(msg), "Restored: %s", restored_path);
+                tui_show_popup("Undo", msg);
+            }
+            input_consume_resize_flag();
+            panel_reload(&panel_left);
+            panel_reload(&panel_right);
             redraw_ui(&cfg, &panel_left, &panel_right, focus, cmd_buffer);
         } else if (key.type == KEY_UP) {
             Layout layout;

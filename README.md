@@ -22,6 +22,10 @@ follows your Omarchy theme automatically.
 - **File operations** — copy, move, delete, create folder/file, rename —
   with live progress reporting and Skip/Overwrite/Abort prompts on
   conflicts.
+- **Recoverable delete** — F8 moves to the freedesktop.org trash (the
+  same one GNOME Files/Dolphin use) instead of deleting outright; F9
+  (or Ctrl+Z in the GUI) undoes the most recent one. Shift+F8 bypasses
+  the trash for a real, permanent delete.
 - **Built-in editor launch** (`$EDITOR`) for text files, by extension.
 - **Command shell bar**, with `cd` support in both front-ends.
 - **Persisted configuration** (`tfm.ini`): last-visited directory per panel,

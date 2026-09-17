@@ -687,14 +687,15 @@ static GtkWidget *build_shell_bar(void)
     return bar;
 }
 
-/* Bottom function-key bar: F5 Copy, F6 Move, F7 Mkdir, F8 Delete, F10 Quit. */
+/* Bottom function-key bar: F5 Copy, F6 Move, F7 Mkdir, F8 Delete, F9
+ * Undo, F10 Quit. */
 typedef struct {
     const char *key;
     const char *label;
 } FunctionKeyDef;
 
 static const FunctionKeyDef FUNCTION_KEYS[] = {
-    {"F5", "Copy"}, {"F6", "Move"}, {"F7", "Mkdir"}, {"F8", "Delete"}, {"F10", "Quit"},
+    {"F5", "Copy"}, {"F6", "Move"}, {"F7", "Mkdir"}, {"F8", "Delete"}, {"F9", "Undo"}, {"F10", "Quit"},
 };
 
 /* Returns the panel's currently selected item (transfer none per
@@ -779,13 +780,16 @@ static void show_error_dialog(const char *title, const char *message)
     g_free(show_alert_dialog(title, message, responses, G_N_ELEMENTS(responses), "ok", "ok"));
 }
 
-/* Yes/no confirmation (F8 Delete) - "Delete" is the destructive
- * response, "Cancel" the default/Escape response. */
-static gboolean confirm_dialog(const char *title, const char *message)
+/* Yes/no confirmation (F8 Delete/Permanently delete) - confirm_label is
+ * the destructive response's own label (distinguishing a regular,
+ * recoverable trash from a permanent delete matters enough to say so on
+ * the button itself, not just the dialog title), "Cancel" is the
+ * default/Escape response. */
+static gboolean confirm_dialog(const char *title, const char *message, const char *confirm_label)
 {
-    static const DialogResponse responses[] = {
+    DialogResponse responses[] = {
         {"cancel", "Cancel", ADW_RESPONSE_DEFAULT},
-        {"confirm", "Delete", ADW_RESPONSE_DESTRUCTIVE},
+        {"confirm", confirm_label, ADW_RESPONSE_DESTRUCTIVE},
     };
     char *response =
         show_alert_dialog(title, message, responses, G_N_ELEMENTS(responses), "cancel", "cancel");
@@ -1136,7 +1140,11 @@ static void action_mkdir(void)
     g_free(name);
 }
 
-static void action_delete(void)
+/* Shared by action_delete()/action_delete_permanent() - permanent
+ * bypasses the trash for a real, unrecoverable delete (e.g. a large
+ * file not worth doubling disk usage for, or sensitive data that
+ * shouldn't linger in ~/.local/share/Trash). */
+static void action_delete_impl(int permanent)
 {
     GuiPanel *active = &g_panel[g_focused_panel];
     GuiPanel *other = other_panel_of_focused();
@@ -1146,8 +1154,10 @@ static void action_delete(void)
     }
 
     char message[300];
-    snprintf(message, sizeof(message), "Delete %s%s?", item->name, item->is_dir ? "/" : "");
-    if (!confirm_dialog("Delete", message)) {
+    snprintf(message, sizeof(message), "%s%s%s?", permanent ? "Permanently delete " : "Delete ",
+             item->name, item->is_dir ? "/" : "");
+    if (!confirm_dialog(permanent ? "Permanently delete" : "Delete", message,
+                         permanent ? "Permanently delete" : "Delete")) {
         return;
     }
 
@@ -1157,13 +1167,52 @@ static void action_delete(void)
         return;
     }
     gui_modal_enter();
-    fileops_delete(target_path, &gui_fileop_callbacks);
+    if (permanent) {
+        fileops_delete(target_path, &gui_fileop_callbacks);
+    } else {
+        fileops_trash(target_path, &gui_fileop_callbacks);
+    }
     gui_progress_hide();
     gui_modal_leave();
     panel_load(active, active->path);
     if (strcmp(active->path, other->path) == 0) {
         panel_load(other, other->path);
     }
+}
+
+static void action_delete(void)
+{
+    action_delete_impl(0);
+}
+
+static void action_delete_permanent(void)
+{
+    action_delete_impl(1);
+}
+
+/* Undo: restores the single most-recently-trashed item (see
+ * fileops_restore_last_trashed()) - not a general undo of copy/move,
+ * and not a trash browser; only ever the most recent delete. Reloads
+ * both panels unconditionally since the restored item's original
+ * directory may be either one, or neither (if the user has since
+ * navigated away). */
+static void action_undo(void)
+{
+    char restored_path[PATH_MAX] = "";
+    gui_modal_enter();
+    int restored =
+        fileops_restore_last_trashed(&gui_fileop_callbacks, restored_path, sizeof(restored_path));
+    gui_progress_hide();
+    gui_modal_leave();
+
+    if (restored) {
+        char message[PATH_MAX + 32];
+        snprintf(message, sizeof(message), "Restored: %s", restored_path);
+        show_error_dialog("Undo", message);
+    }
+
+    panel_load(&g_panel[0], g_panel[0].path);
+    panel_load(&g_panel[1], g_panel[1].path);
 }
 
 static void on_function_button_clicked(GtkButton *button, gpointer user_data)
@@ -1189,6 +1238,8 @@ static void on_function_button_clicked(GtkButton *button, gpointer user_data)
         action_mkdir();
     } else if (strcmp(key, "F8") == 0) {
         action_delete();
+    } else if (strcmp(key, "F9") == 0) {
+        action_undo();
     }
 }
 
@@ -1437,7 +1488,23 @@ static gboolean on_window_key_pressed(GtkEventControllerKey *controller, guint k
         return GDK_EVENT_STOP;
     }
     if (keyval == GDK_KEY_F8) {
-        action_delete();
+        /* Shift+F8 bypasses the trash for a real, permanent delete - see
+         * action_delete_impl()'s comment. */
+        if (state & GDK_SHIFT_MASK) {
+            action_delete_permanent();
+        } else {
+            action_delete();
+        }
+        return GDK_EVENT_STOP;
+    }
+    if (keyval == GDK_KEY_F9) {
+        action_undo();
+        return GDK_EVENT_STOP;
+    }
+    /* Ctrl+Z as the more familiar "undo" shortcut, alongside F9 (which
+     * mirrors the TUI's own binding). */
+    if (keyval == GDK_KEY_z && (state & GDK_CONTROL_MASK)) {
+        action_undo();
         return GDK_EVENT_STOP;
     }
     if (keyval == GDK_KEY_F10) {

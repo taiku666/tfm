@@ -2,6 +2,7 @@
 
 #include "fileops.h"
 
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -9,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "tfm_common.h"
@@ -1101,6 +1103,385 @@ void fileops_move(const char *src, const char *dest_dir, const FileOpCallbacks *
                          "Copied, but could not remove the original; source left in place.");
         }
     }
+}
+
+/* Moves src to the exact path dest (not "into" a directory - dest is
+ * the full destination path), via rename() first and a copy+delete
+ * fallback across filesystems. Shared by fileops_trash() and
+ * fileops_restore_last_trashed() so both reuse the same cross-device-
+ * safe move semantics fileops_move() already has, without going
+ * through its dest_dir/basename-joining logic - trash needs an exact,
+ * collision-resolved destination name, not src's own basename. Returns
+ * 1 on success, 0 if aborted/failed (reported via cb). */
+static int move_to_exact_dest(const char *src, const char *dest, const FileOpCallbacks *cb)
+{
+    if (rename(src, dest) == 0) {
+        return 1;
+    }
+    if (errno != EXDEV) {
+        report_error(cb, "Error moving", strerror(errno));
+        return 0;
+    }
+
+    CopyProgress progress;
+    progress.total_bytes = compute_total_size(src, cb);
+    progress.copied_bytes = 0;
+    progress.last_reported_percent = -1;
+
+    report_progress(cb, "Moving...", src, 0.0);
+
+    int had_skip = 0;
+    if (!copy_recursive(src, dest, &progress, cb, &had_skip)) {
+        return 0;
+    }
+    if (had_skip) {
+        report_error(cb, "Move incomplete",
+                     "Some files were skipped and were not moved; source left in place.");
+        return 0;
+    }
+    if (!delete_recursive(src, cb)) {
+        report_error(cb, "Move incomplete",
+                     "Copied, but could not remove the original; source left in place.");
+        return 0;
+    }
+    return 1;
+}
+
+/* Recursively creates every missing directory component of path (like
+ * "mkdir -p"), including path itself. Tolerates EEXIST at every level -
+ * expected on the common case where most of the chain already exists. */
+static int mkdir_parents(const char *path, mode_t mode)
+{
+    char buf[PATH_MAX];
+    if ((size_t)snprintf(buf, sizeof(buf), "%s", path) >= sizeof(buf)) {
+        return 0;
+    }
+    for (char *p = buf + 1; *p != '\0'; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            if (mkdir(buf, mode) != 0 && errno != EEXIST) {
+                return 0;
+            }
+            *p = '/';
+        }
+    }
+    return mkdir(buf, mode) == 0 || errno == EEXIST;
+}
+
+/* Resolves the freedesktop.org "home trash" files/ and info/ directories
+ * ($XDG_DATA_HOME/Trash, or ~/.local/share/Trash if unset), creating
+ * them (mode 0700 - trash contents are as sensitive as the files in it)
+ * if they don't exist yet. Returns 1 on success. Deliberately only
+ * implements the home-trash case, not a per-mount $topdir/.Trash-$uid
+ * for other filesystems - see fileops.h. */
+static int get_trash_dirs(char *files_dir, size_t files_size, char *info_dir, size_t info_size)
+{
+    char base[PATH_MAX];
+    const char *data_home = getenv("XDG_DATA_HOME");
+    int n;
+    if (data_home != NULL && data_home[0] != '\0') {
+        n = snprintf(base, sizeof(base), "%s/Trash", data_home);
+    } else {
+        const char *home = getenv("HOME");
+        if (home == NULL || home[0] == '\0') {
+            return 0;
+        }
+        n = snprintf(base, sizeof(base), "%s/.local/share/Trash", home);
+    }
+    if (n <= 0 || (size_t)n >= sizeof(base)) {
+        return 0;
+    }
+
+    if ((size_t)snprintf(files_dir, files_size, "%s/files", base) >= files_size ||
+        (size_t)snprintf(info_dir, info_size, "%s/info", base) >= info_size) {
+        return 0;
+    }
+
+    return mkdir_parents(files_dir, 0700) && mkdir_parents(info_dir, 0700);
+}
+
+/* Finds a name for basename inside files_dir that doesn't already exist
+ * (checked with lstat, so a leftover dangling symlink still counts as
+ * "taken"), appending " (1)", " (2)", ... on collision. Writes the
+ * chosen name (not a full path) into out_name. The same name (with the
+ * same suffix, if any) is used for both files/<name> and
+ * info/<name>.trashinfo - fileops_restore_last_trashed() relies on that
+ * exact pairing to find the trashed item that matches a given metadata
+ * file. */
+static int unique_trash_name(const char *files_dir, const char *basename, char *out_name,
+                              size_t out_name_size)
+{
+    if ((size_t)snprintf(out_name, out_name_size, "%s", basename) >= out_name_size) {
+        return 0;
+    }
+    for (int suffix = 1; suffix < 100000; suffix++) {
+        char candidate_path[PATH_MAX];
+        if (!path_join(candidate_path, sizeof(candidate_path), files_dir, out_name)) {
+            return 0;
+        }
+        struct stat st;
+        if (lstat(candidate_path, &st) != 0) {
+            return 1;
+        }
+        if ((size_t)snprintf(out_name, out_name_size, "%s (%d)", basename, suffix) >= out_name_size) {
+            return 0;
+        }
+    }
+    return 0;
+}
+
+/* Percent-encodes path for a .trashinfo "Path=" line, per the
+ * freedesktop.org trash spec (everything except a small unreserved set
+ * must be encoded) - without this, a path containing e.g. a space or a
+ * non-ASCII byte would produce a malformed/ambiguous key file that other
+ * trash-spec-aware tools (and this codebase's own decoder below) could
+ * misparse. Silently stops (leaving out valid so far) if out is too
+ * small rather than overflowing it. */
+static void percent_encode_path(const char *path, char *out, size_t out_size)
+{
+    static const char *unreserved =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789/-_.~";
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)path; *p != '\0'; p++) {
+        if (strchr(unreserved, (int)*p) != NULL) {
+            if (o + 1 >= out_size) {
+                break;
+            }
+            out[o++] = (char)*p;
+        } else {
+            if (o + 3 >= out_size) {
+                break;
+            }
+            snprintf(out + o, 4, "%%%02X", *p);
+            o += 3;
+        }
+    }
+    out[o] = '\0';
+}
+
+/* Reverses percent_encode_path() - an unrecognized "%" (not followed by
+ * two hex digits, e.g. truncated or hand-edited metadata) is copied
+ * through literally rather than misinterpreted. */
+static void percent_decode_path(const char *in, char *out, size_t out_size)
+{
+    size_t o = 0;
+    for (const char *p = in; *p != '\0' && o + 1 < out_size;) {
+        if (p[0] == '%' && isxdigit((unsigned char)p[1]) && isxdigit((unsigned char)p[2])) {
+            char hex[3] = {p[1], p[2], '\0'};
+            out[o++] = (char)strtol(hex, NULL, 16);
+            p += 3;
+        } else {
+            out[o++] = *p++;
+        }
+    }
+    out[o] = '\0';
+}
+
+void fileops_trash(const char *path, const FileOpCallbacks *cb)
+{
+    if (is_unsafe_root_path(path)) {
+        report_error(cb, "Error", "Refusing to trash this path");
+        return;
+    }
+
+    char normalized[PATH_MAX];
+    if ((size_t)snprintf(normalized, sizeof(normalized), "%s", path) >= sizeof(normalized)) {
+        report_error(cb, "Path too long", path);
+        return;
+    }
+    strip_trailing_slashes(normalized);
+    path = normalized;
+
+    const char *base = strrchr(path, '/');
+    base = (base != NULL) ? base + 1 : path;
+    if (base[0] == '\0') {
+        report_error(cb, "Error", "Refusing to trash this path");
+        return;
+    }
+
+    /* The original location is recorded in the .trashinfo metadata so
+     * fileops_restore_last_trashed() can put it back - must be absolute,
+     * since a relative path would be meaningless once the process's
+     * current directory changes (or a different process/session does
+     * the restoring). */
+    char abs_path[PATH_MAX];
+    if (path[0] == '/') {
+        if ((size_t)snprintf(abs_path, sizeof(abs_path), "%s", path) >= sizeof(abs_path)) {
+            report_error(cb, "Path too long", path);
+            return;
+        }
+    } else {
+        char cwd[PATH_MAX];
+        if (getcwd(cwd, sizeof(cwd)) == NULL || !path_join(abs_path, sizeof(abs_path), cwd, path)) {
+            report_error(cb, "Error", "Could not resolve the absolute path to trash");
+            return;
+        }
+    }
+
+    char files_dir[PATH_MAX], info_dir[PATH_MAX];
+    if (!get_trash_dirs(files_dir, sizeof(files_dir), info_dir, sizeof(info_dir))) {
+        report_error(cb, "Error", "Could not access or create the trash directory");
+        return;
+    }
+
+    char trash_name[PATH_MAX];
+    if (!unique_trash_name(files_dir, base, trash_name, sizeof(trash_name))) {
+        report_error(cb, "Error", "Could not find a free name in the trash");
+        return;
+    }
+
+    char dest[PATH_MAX], info_path[PATH_MAX];
+    if (!path_join(dest, sizeof(dest), files_dir, trash_name) ||
+        (size_t)snprintf(info_path, sizeof(info_path), "%s/%s.trashinfo", info_dir, trash_name) >=
+            sizeof(info_path)) {
+        report_error(cb, "Path too long", trash_name);
+        return;
+    }
+
+    if (!move_to_exact_dest(path, dest, cb)) {
+        return;
+    }
+
+    /* Metadata is written AFTER the move succeeds: if this fails (e.g.
+     * disk full), the item is still safely sitting in files/ - just
+     * without a way to auto-restore its original location, not lost. */
+    FILE *fp = fopen(info_path, "w");
+    if (fp != NULL) {
+        char encoded[PATH_MAX * 3];
+        percent_encode_path(abs_path, encoded, sizeof(encoded));
+
+        time_t now = time(NULL);
+        struct tm tm_now;
+        char timestamp[32] = "";
+        if (localtime_r(&now, &tm_now) != NULL) {
+            strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%S", &tm_now);
+        }
+
+        fprintf(fp, "[Trash Info]\nPath=%s\nDeletionDate=%s\n", encoded, timestamp);
+        fclose(fp);
+    }
+}
+
+int fileops_restore_last_trashed(const FileOpCallbacks *cb, char *restored_path_out,
+                                  size_t restored_path_out_size)
+{
+    char files_dir[PATH_MAX], info_dir[PATH_MAX];
+    if (!get_trash_dirs(files_dir, sizeof(files_dir), info_dir, sizeof(info_dir))) {
+        report_error(cb, "Error", "Could not access the trash directory");
+        return 0;
+    }
+
+    DIR *dp = opendir(info_dir);
+    if (dp == NULL) {
+        report_error(cb, "Nothing to undo", "The trash is empty.");
+        return 0;
+    }
+
+    /* Finds the *.trashinfo file with the newest mtime - that file's own
+     * mtime is effectively its deletion time, since fileops_trash() just
+     * wrote it, so no separate DeletionDate parsing is needed to find
+     * the most recent one. */
+    static const char trashinfo_suffix[] = ".trashinfo";
+    char newest_name[PATH_MAX] = "";
+    time_t newest_mtime = 0;
+    struct dirent *entry;
+    errno = 0;
+    while ((entry = readdir(dp)) != NULL) {
+        size_t name_len = strlen(entry->d_name);
+        size_t suffix_len = sizeof(trashinfo_suffix) - 1;
+        if (name_len <= suffix_len ||
+            strcmp(entry->d_name + name_len - suffix_len, trashinfo_suffix) != 0) {
+            continue;
+        }
+        char full[PATH_MAX];
+        if (!path_join(full, sizeof(full), info_dir, entry->d_name)) {
+            continue;
+        }
+        struct stat st;
+        if (stat(full, &st) != 0) {
+            continue;
+        }
+        if (newest_name[0] == '\0' || st.st_mtime > newest_mtime) {
+            newest_mtime = st.st_mtime;
+            snprintf(newest_name, sizeof(newest_name), "%s", entry->d_name);
+        }
+    }
+    closedir(dp);
+
+    if (newest_name[0] == '\0') {
+        report_error(cb, "Nothing to undo", "The trash is empty.");
+        return 0;
+    }
+
+    /* Strips ".trashinfo" to recover the trash item's own name - matches
+     * files/<name> exactly (see unique_trash_name()'s comment). */
+    size_t item_name_len = strlen(newest_name) - (sizeof(trashinfo_suffix) - 1);
+    char item_name[PATH_MAX];
+    snprintf(item_name, sizeof(item_name), "%.*s", (int)item_name_len, newest_name);
+
+    char info_path[PATH_MAX];
+    if ((size_t)snprintf(info_path, sizeof(info_path), "%s/%s.trashinfo", info_dir, item_name) >=
+        sizeof(info_path)) {
+        report_error(cb, "Error", "Path too long");
+        return 0;
+    }
+
+    char original_path[PATH_MAX] = "";
+    FILE *fp = fopen(info_path, "r");
+    if (fp == NULL) {
+        report_error(cb, "Error", "Could not read trash metadata");
+        return 0;
+    }
+    char line[PATH_MAX + 16];
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        char *nl = strchr(line, '\n');
+        if (nl != NULL) {
+            *nl = '\0';
+        }
+        if (strncmp(line, "Path=", 5) == 0) {
+            percent_decode_path(line + 5, original_path, sizeof(original_path));
+            break;
+        }
+    }
+    fclose(fp);
+
+    if (original_path[0] == '\0') {
+        report_error(cb, "Error", "Trash metadata is missing the original path");
+        return 0;
+    }
+
+    /* Never overwrite: if something now occupies the original spot
+     * (e.g. a new file was created with that name after the trash), fail
+     * cleanly instead of silently clobbering it - there's no
+     * Retry/Skip/Abort question that makes sense here, unlike a normal
+     * copy/move conflict, since the "conflict" is with unrelated data
+     * the user created after the delete, not a stale copy of the same
+     * operation. */
+    struct stat existing;
+    if (lstat(original_path, &existing) == 0) {
+        report_error(cb, "Cannot undo", "Something already exists at the original location.");
+        return 0;
+    }
+
+    char trashed_item_path[PATH_MAX];
+    if (!path_join(trashed_item_path, sizeof(trashed_item_path), files_dir, item_name)) {
+        report_error(cb, "Error", "Path too long");
+        return 0;
+    }
+
+    if (!move_to_exact_dest(trashed_item_path, original_path, cb)) {
+        return 0;
+    }
+
+    /* Only removed after the move back succeeds - if move_to_exact_dest()
+     * failed (e.g. the original directory no longer exists), the item
+     * stays in the trash for another attempt instead of being lost. */
+    remove(info_path);
+
+    if (restored_path_out != NULL) {
+        snprintf(restored_path_out, restored_path_out_size, "%s", original_path);
+    }
+    return 1;
 }
 
 void fileops_delete(const char *path, const FileOpCallbacks *cb)

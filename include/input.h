@@ -35,7 +35,10 @@ typedef enum {
 
 typedef struct {
     KeyType type;
-    char ch; /* valid only when type == KEY_CHAR */
+    char ch;    /* valid only when type == KEY_CHAR */
+    int shift;  /* 1 if Shift was held - currently only ever set for
+                 * KEY_F8 (Shift+F8, the permanent-delete bypass); 0 for
+                 * every other KeyType. */
 } KeyEvent;
 
 /* Puts the terminal into raw mode (no echo, no line buffering). Must be

@@ -215,7 +215,7 @@ static int read_seq_byte(char *out)
 
 KeyEvent input_read_key(void)
 {
-    KeyEvent event = {KEY_NONE, 0};
+    KeyEvent event = {KEY_NONE, 0, 0};
     char c;
 
     ssize_t n = read_one_byte(&c);
@@ -282,6 +282,18 @@ KeyEvent input_read_key(void)
     KeyType matched = lookup_esc_sequence(seq, seq_len);
     if (matched != KEY_UNKNOWN) {
         event.type = matched;
+        return event;
+    }
+
+    /* Shift+F8 (permanent-delete bypass for the trash feature) - xterm's
+     * modified-key encoding is "<code>;<modifier>~" (modifier 2 =
+     * Shift), distinct from the plain "[19~" F8 entry in
+     * ESC_SEQUENCES. Deliberately narrow (just this one combination,
+     * not a general modifier parser) since it's the only modified
+     * function key tfm currently binds anything to. */
+    if (seq_len == 6 && memcmp(seq, "[19;2~", 6) == 0) {
+        event.type = KEY_F8;
+        event.shift = 1;
         return event;
     }
 

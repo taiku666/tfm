@@ -3,6 +3,24 @@
 Versioned via `TFM_VERSION` in `include/tfm_common.h` and git tags
 (`vX.Y.Z`); this file tracks notable changes per release.
 
+## Unreleased
+
+- **Recoverable delete (trash/undo).** F8 now moves the selected item to
+  the freedesktop.org home trash (`$XDG_DATA_HOME/Trash`, the same
+  location GNOME Files/Dolphin use) instead of deleting it outright,
+  writing standard `.trashinfo` metadata so it's restorable from those
+  tools too. F9 (TUI) / Ctrl+Z or F9 (GUI) undoes the single most
+  recently trashed item, restoring it to its original path - not a
+  trash browser, and not undo for copy/move, just "undo my last
+  delete." Shift+F8 bypasses the trash for a real, permanent,
+  unrecoverable delete (e.g. for large files or sensitive data). Cross-
+  filesystem trashing reuses the same copy-then-delete fallback
+  `fileops_move()` already had. Verified with real `/tmp` fault-
+  injection tests (collision-safe naming, empty-trash/overwrite-refusal
+  edge cases, percent-encoding round-trip for paths with spaces/special
+  characters) and a live Hyprland session covering all three key
+  bindings end-to-end.
+
 ## 0.4.0
 
 - Closed out nearly every remaining open Medium/Low finding from the
