@@ -53,9 +53,75 @@ void config_set_defaults(Config *cfg)
     snprintf(cfg->panel_border_color, sizeof(cfg->panel_border_color), "system");
     snprintf(cfg->text_color, sizeof(cfg->text_color), "system");
     snprintf(cfg->cursor_color, sizeof(cfg->cursor_color), "system");
+    snprintf(cfg->dir_color, sizeof(cfg->dir_color), "blue");
     snprintf(cfg->icons, sizeof(cfg->icons), "omarchy");
     snprintf(cfg->gui_theme, sizeof(cfg->gui_theme), "omarchy");
     snprintf(cfg->editor_extensions, sizeof(cfg->editor_extensions), DEFAULT_EDITOR_EXTENSIONS);
+}
+
+/* Escapes a value for one INI line: '\' -> "\\", '\n' -> "\n" (literal
+ * backslash-n, two characters), '\r' -> "\r" - without this, a path
+ * containing a literal newline byte would split one logical value across
+ * two physical .ini lines on save (the first fragment reloads, the
+ * second has no '=' and is silently dropped). Returns 1 if the escaped
+ * result fit in out, 0 if truncated - config_save() treats that as a
+ * save failure rather than writing a corrupt line. */
+static int escape_value(const char *in, char *out, size_t out_size)
+{
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)in; *p != '\0'; p++) {
+        const char *rep = NULL;
+        if (*p == '\\') {
+            rep = "\\\\";
+        } else if (*p == '\n') {
+            rep = "\\n";
+        } else if (*p == '\r') {
+            rep = "\\r";
+        }
+        if (rep != NULL) {
+            size_t len = strlen(rep);
+            if (o + len >= out_size) {
+                return 0;
+            }
+            memcpy(out + o, rep, len);
+            o += len;
+        } else {
+            if (o + 1 >= out_size) {
+                return 0;
+            }
+            out[o++] = (char)*p;
+        }
+    }
+    out[o] = '\0';
+    return 1;
+}
+
+/* Reverses escape_value() in place, on an already-trim()'d value.
+ * An unrecognized backslash sequence (e.g. a lone trailing backslash, or
+ * a pre-escaping tfm.ini that never had one) is left as a literal
+ * backslash rather than silently dropped, so older config files still
+ * round-trip unchanged. */
+static void unescape_value(char *s)
+{
+    char *w = s;
+    for (char *r = s; *r != '\0'; r++) {
+        if (*r == '\\' && r[1] != '\0') {
+            r++;
+            if (*r == 'n') {
+                *w++ = '\n';
+            } else if (*r == 'r') {
+                *w++ = '\r';
+            } else if (*r == '\\') {
+                *w++ = '\\';
+            } else {
+                *w++ = '\\';
+                *w++ = *r;
+            }
+        } else {
+            *w++ = *r;
+        }
+    }
+    *w = '\0';
 }
 
 static char *trim(char *s)
@@ -117,6 +183,9 @@ void config_load(Config *cfg)
         *eq = '\0';
         char *key = trim(trimmed);
         char *value = trim(eq + 1);
+        /* Reverse escape_value()'s encoding before storing - see its
+         * comment for why a value can contain an escaped '\n'/'\r'/'\\'. */
+        unescape_value(value);
 
         if (strcmp(section, "panels") == 0) {
             /* An empty/whitespace-only value (value[0] == '\0' after
@@ -138,6 +207,8 @@ void config_load(Config *cfg)
                 snprintf(cfg->text_color, sizeof(cfg->text_color), "%s", value);
             } else if (strcmp(key, "cursor_color") == 0) {
                 snprintf(cfg->cursor_color, sizeof(cfg->cursor_color), "%s", value);
+            } else if (strcmp(key, "dir_color") == 0) {
+                snprintf(cfg->dir_color, sizeof(cfg->dir_color), "%s", value);
             } else if (strcmp(key, "icons") == 0) {
                 snprintf(cfg->icons, sizeof(cfg->icons), "%s", value);
             } else if (strcmp(key, "gui_theme") == 0) {
@@ -196,19 +267,33 @@ void config_save(const Config *cfg)
         return;
     }
 
+    /* Escaped into a buffer sized for the largest field (left_path/
+     * right_path, PATH_MAX) - reused for every key since writes happen
+     * one at a time, sequentially. A value that doesn't fit even after
+     * escaping (only possible for the two PATH_MAX path fields, if every
+     * byte needed escaping) fails the whole save rather than writing a
+     * silently truncated line. */
+    char esc[PATH_MAX * 2 + 16];
     int ok = 1;
+
+#define WRITE_KV(key, value) \
+    (ok = ok && escape_value((value), esc, sizeof(esc)) && fprintf(fp, key "=%s\n", esc) >= 0)
+
     ok = ok && fprintf(fp, "[panels]\n") >= 0;
-    ok = ok && fprintf(fp, "left_path=%s\n", cfg->left_path) >= 0;
-    ok = ok && fprintf(fp, "right_path=%s\n", cfg->right_path) >= 0;
+    WRITE_KV("left_path", cfg->left_path);
+    WRITE_KV("right_path", cfg->right_path);
     ok = ok && fprintf(fp, "\n[display]\n") >= 0;
-    ok = ok && fprintf(fp, "border_color=%s\n", cfg->border_color) >= 0;
-    ok = ok && fprintf(fp, "panel_border_color=%s\n", cfg->panel_border_color) >= 0;
-    ok = ok && fprintf(fp, "text_color=%s\n", cfg->text_color) >= 0;
-    ok = ok && fprintf(fp, "cursor_color=%s\n", cfg->cursor_color) >= 0;
-    ok = ok && fprintf(fp, "icons=%s\n", cfg->icons) >= 0;
-    ok = ok && fprintf(fp, "gui_theme=%s\n", cfg->gui_theme) >= 0;
+    WRITE_KV("border_color", cfg->border_color);
+    WRITE_KV("panel_border_color", cfg->panel_border_color);
+    WRITE_KV("text_color", cfg->text_color);
+    WRITE_KV("cursor_color", cfg->cursor_color);
+    WRITE_KV("dir_color", cfg->dir_color);
+    WRITE_KV("icons", cfg->icons);
+    WRITE_KV("gui_theme", cfg->gui_theme);
     ok = ok && fprintf(fp, "\n[editor]\n") >= 0;
-    ok = ok && fprintf(fp, "extensions=%s\n", cfg->editor_extensions) >= 0;
+    WRITE_KV("extensions", cfg->editor_extensions);
+
+#undef WRITE_KV
 
     if (fclose(fp) != 0) {
         ok = 0;
@@ -222,6 +307,10 @@ void config_save(const Config *cfg)
 
 int config_is_editor_extension(const Config *cfg, const char *filename)
 {
+    if (cfg == NULL || filename == NULL) {
+        return 0;
+    }
+
     const char *dot = strrchr(filename, '.');
     if (dot == NULL || dot == filename || dot[1] == '\0') {
         /* A leading dot (e.g. ".bashrc") is part of the filename, not an extension. */

@@ -14,6 +14,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <glib-unix.h>
+#include <locale.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +30,11 @@
 #include "fileops.h"
 #include "shell.h"
 #include "tfm_common.h"
+
+/* Fallback GTK monospace font size (points) used whenever the active
+ * terminal's own configured size can't be determined - was previously
+ * four separate literal 11.0s that had to be kept in sync by hand. */
+#define GUI_DEFAULT_FONT_SIZE 11.0
 
 /* One entry in a panel's list (file/dir or ".." to go up). Wrapped as a
  * GObject so GtkListView/GListStore can manage it. */
@@ -81,6 +87,14 @@ static GuiPanel g_panel[2];
 static int g_focused_panel = 0;
 static GtkWidget *g_shell_entry = NULL;
 static GtkWindow *g_window = NULL;
+
+/* Mirrors the TUI's own other_panel_of() (src/main.c) - was previously
+ * four separate "g_panel[g_focused_panel == 0 ? 1 : 0]" sites here that
+ * had to be kept in sync by hand. */
+static GuiPanel *other_panel_of_focused(void)
+{
+    return &g_panel[g_focused_panel == 0 ? 1 : 0];
+}
 
 /* Counts nested modal dialogs/progress popups (Rename, New Folder, error/
  * overwrite prompts, Copy/Move progress). on_window_key_pressed() is
@@ -165,13 +179,49 @@ static void panel_load_indexed(GuiPanel *panel, const char *path, int panel_inde
         path = fallback;
     }
 
+    /* Remember the currently selected item's name (if any) before the
+     * listing is rebuilt below - GtkSingleSelection has no memory of a
+     * specific item across a wholesale g_list_store replacement, so a
+     * reload (e.g. after F5 Copy, or a shell command that happened to
+     * touch this directory) previously always reset the selection back
+     * to index 0, losing the user's place in a long listing. */
+    char selected_name[256] = "";
+    GtkSelectionModel *old_model = gtk_list_view_get_model(GTK_LIST_VIEW(panel->list_view));
+    if (old_model != NULL) {
+        TfmFileItem *cur =
+            TFM_FILE_ITEM(gtk_single_selection_get_selected_item(GTK_SINGLE_SELECTION(old_model)));
+        if (cur != NULL) {
+            snprintf(selected_name, sizeof(selected_name), "%s", cur->name);
+        }
+    }
+
     g_list_store_remove_all(panel->store);
+    guint restore_index = 0;
+    gboolean restore_found = FALSE;
     for (size_t i = 0; i < count; i++) {
         TfmFileItem *item = tfm_file_item_new(entries[i].name, entries[i].is_dir);
         g_list_store_append(panel->store, item);
         g_object_unref(item);
+
+        if (!restore_found && selected_name[0] != '\0' && strcmp(entries[i].name, selected_name) == 0) {
+            restore_index = (guint)i;
+            restore_found = TRUE;
+        }
     }
     dir_list_free(entries);
+
+    /* Same model as old_model above (g_list_store_remove_all()/append()
+     * mutate the store in place rather than replacing the selection
+     * model) - re-selecting by name, or falling back to the top entry if
+     * the previously selected one is gone (e.g. it was just deleted or
+     * moved away). */
+    if (old_model != NULL && count > 0) {
+        guint index_to_select = restore_found ? restore_index : 0;
+        gtk_single_selection_set_selected(GTK_SINGLE_SELECTION(old_model), index_to_select);
+        /* Selecting an item outside the currently visible rows doesn't
+         * by itself scroll it into view. */
+        gtk_list_view_scroll_to(GTK_LIST_VIEW(panel->list_view), index_to_select, GTK_LIST_SCROLL_NONE, NULL);
+    }
 
     /* Callers may pass panel->path itself as path (e.g. to reload the
      * same path after a shell command) - snprintf with overlapping
@@ -211,6 +261,13 @@ static void panel_navigate_into(GuiPanel *panel, const char *name)
             *slash = '\0';
             snprintf(new_path, sizeof(new_path), "%s", tmp);
         }
+    } else if (panel->path[0] == '\0') {
+        /* panel->path can only be empty in the extremely rare startup case
+         * where even the $HOME/"/" fallback in panel_load_indexed() failed
+         * (see its comment) - without this guard, "%s/%s" below would
+         * silently build "/name" (filesystem root) instead of refusing the
+         * navigation. */
+        return;
     } else if (strcmp(panel->path, "/") == 0) {
         if ((size_t)snprintf(new_path, sizeof(new_path), "/%s", name) >= sizeof(new_path)) {
             return;
@@ -242,20 +299,39 @@ static void panel_navigate_into(GuiPanel *panel, const char *name)
 static GtkCssProvider *g_theme_css_provider = NULL;
 static Config g_cfg;
 
+/* Midpoint of the 0-255 luma range: above it, a black foreground reads
+ * better on the accent color; at or below it, white does. */
+#define LUMA_CONTRAST_THRESHOLD 150.0
+
 /* Rough brightness estimate (Rec. 601 luma) to pick a readable
  * foreground (black/white) for an accent color - Omarchy themes only
- * supply the accent color itself, not a matching contrast color. */
+ * supply the accent color itself, not a matching contrast color.
+ * Accepts both "#rrggbb" (every real Omarchy theme colors.toml uses
+ * this) and the shorter CSS-style "#rgb" shorthand (each nibble
+ * duplicated, e.g. "#f80" -> "#ff8800") - a hand-edited colors.toml
+ * using the shorthand used to always fall back to white regardless of
+ * the color's actual brightness. */
 static const char *contrasting_fg_for(const char *hex_color)
 {
-    if (strlen(hex_color) != 7 || hex_color[0] != '#') {
-        return "#ffffff";
-    }
     unsigned int r, g, b;
-    if (sscanf(hex_color + 1, "%02x%02x%02x", &r, &g, &b) != 3) {
+    size_t len = strlen(hex_color);
+    if (len == 7 && hex_color[0] == '#') {
+        if (sscanf(hex_color + 1, "%02x%02x%02x", &r, &g, &b) != 3) {
+            return "#ffffff";
+        }
+    } else if (len == 4 && hex_color[0] == '#') {
+        unsigned int r1, g1, b1;
+        if (sscanf(hex_color + 1, "%1x%1x%1x", &r1, &g1, &b1) != 3) {
+            return "#ffffff";
+        }
+        r = r1 * 16 + r1;
+        g = g1 * 16 + g1;
+        b = b1 * 16 + b1;
+    } else {
         return "#ffffff";
     }
     double luma = 0.299 * r + 0.587 * g + 0.114 * b;
-    return (luma > 150.0) ? "#000000" : "#ffffff";
+    return (luma > LUMA_CONTRAST_THRESHOLD) ? "#000000" : "#ffffff";
 }
 
 /* Loads the active Omarchy theme (if cfg->gui_theme == "omarchy") and
@@ -292,13 +368,6 @@ static void apply_omarchy_theme(void)
     adw_style_manager_set_color_scheme(style_manager,
                                         colors.is_dark ? ADW_COLOR_SCHEME_FORCE_DARK
                                                         : ADW_COLOR_SCHEME_FORCE_LIGHT);
-
-    if (g_theme_css_provider != NULL) {
-        gtk_style_context_remove_provider_for_display(display,
-                                                        GTK_STYLE_PROVIDER(g_theme_css_provider));
-        g_object_unref(g_theme_css_provider);
-        g_theme_css_provider = NULL;
-    }
 
     /* colors.toml doesn't guarantee every key - without background/
      * foreground, fall back to the libadwaita default for the current
@@ -353,10 +422,20 @@ static void apply_omarchy_theme(void)
              "padding: 3px; }\n",
              corner_radius > 0 ? corner_radius : 0);
 
-    g_theme_css_provider = gtk_css_provider_new();
+    /* Reload the existing provider's content in place rather than
+     * destroying and recreating it (remove-from-display, unref, new
+     * provider, add-to-display) on every theme-reload/SIGUSR1 call -
+     * GtkCssProvider supports being re-loaded, and staying attached to the
+     * display the whole time avoids a visible flash of unstyled content
+     * between remove and re-add. Only actually needed the first time (or
+     * after apply_omarchy_theme() tore it down via the !can_apply branch
+     * above). */
+    if (g_theme_css_provider == NULL) {
+        g_theme_css_provider = gtk_css_provider_new();
+        gtk_style_context_add_provider_for_display(display, GTK_STYLE_PROVIDER(g_theme_css_provider),
+                                                    GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    }
     gtk_css_provider_load_from_string(g_theme_css_provider, css);
-    gtk_style_context_add_provider_for_display(display, GTK_STYLE_PROVIDER(g_theme_css_provider),
-                                                GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
 }
 
 /* omarchy-theme-set sends SIGUSR1 to tfm-gui (via the hook in
@@ -567,7 +646,13 @@ static void on_shell_entry_activate(GtkEntry *entry, gpointer user_data)
         gui_modal_leave();
         if (exit_code != 0) {
             char message[300];
-            snprintf(message, sizeof(message), "Exit code %d: %s", exit_code, command);
+            int written = snprintf(message, sizeof(message), "Exit code %d: %s", exit_code, command);
+            if (written < 0 || (size_t)written >= sizeof(message)) {
+                /* command is user-typed and unbounded - make a silent
+                 * truncation visible instead of just cutting it off
+                 * mid-word with no indication anything was cut. */
+                snprintf(message + sizeof(message) - 4, 4, "...");
+            }
             show_error_dialog("Error", message);
         }
     }
@@ -948,7 +1033,7 @@ static const FileOpCallbacks gui_fileop_callbacks = {
 static void action_copy(void)
 {
     GuiPanel *active = &g_panel[g_focused_panel];
-    GuiPanel *other = &g_panel[g_focused_panel == 0 ? 1 : 0];
+    GuiPanel *other = other_panel_of_focused();
     TfmFileItem *item = panel_get_selected_item(active);
     if (item == NULL || strcmp(item->name, "..") == 0) {
         return;
@@ -971,7 +1056,7 @@ static void action_copy(void)
 static void action_move(void)
 {
     GuiPanel *active = &g_panel[g_focused_panel];
-    GuiPanel *other = &g_panel[g_focused_panel == 0 ? 1 : 0];
+    GuiPanel *other = other_panel_of_focused();
     TfmFileItem *item = panel_get_selected_item(active);
     if (item == NULL || strcmp(item->name, "..") == 0) {
         return;
@@ -1030,7 +1115,7 @@ static void action_move(void)
 static void action_mkdir(void)
 {
     GuiPanel *active = &g_panel[g_focused_panel];
-    GuiPanel *other = &g_panel[g_focused_panel == 0 ? 1 : 0];
+    GuiPanel *other = other_panel_of_focused();
     char *name = prompt_text_dialog("New folder", "");
     if (name == NULL) {
         return;
@@ -1054,7 +1139,7 @@ static void action_mkdir(void)
 static void action_delete(void)
 {
     GuiPanel *active = &g_panel[g_focused_panel];
-    GuiPanel *other = &g_panel[g_focused_panel == 0 ? 1 : 0];
+    GuiPanel *other = other_panel_of_focused();
     TfmFileItem *item = panel_get_selected_item(active);
     if (item == NULL || strcmp(item->name, "..") == 0) {
         return;
@@ -1247,22 +1332,22 @@ static int is_foot_the_active_terminal(void)
 static double read_terminal_font_size(void)
 {
     if (!is_foot_the_active_terminal()) {
-        return 11.0;
+        return GUI_DEFAULT_FONT_SIZE;
     }
 
     const char *home = getenv("HOME");
     if (home == NULL) {
-        return 11.0;
+        return GUI_DEFAULT_FONT_SIZE;
     }
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "%s/.config/foot/foot.ini", home);
 
     FILE *fp = fopen(path, "r");
     if (fp == NULL) {
-        return 11.0;
+        return GUI_DEFAULT_FONT_SIZE;
     }
 
-    double size = 11.0;
+    double size = GUI_DEFAULT_FONT_SIZE;
     char line[256];
     while (fgets(line, sizeof(line), fp) != NULL) {
         char *p = line;
@@ -1286,30 +1371,24 @@ static double read_terminal_font_size(void)
      * otherwise flow straight into generated CSS as e.g. "infpt". Clamp
      * to a sane font-size range instead of just checking > 0. */
     if (!isfinite(size) || size < 6.0 || size > 32.0) {
-        return 11.0;
+        return GUI_DEFAULT_FONT_SIZE;
     }
     return size;
 }
 
-static double g_font_size = 11.0;
-static double g_default_font_size = 11.0;
+static double g_font_size = GUI_DEFAULT_FONT_SIZE;
+static double g_default_font_size = GUI_DEFAULT_FONT_SIZE;
 static GtkCssProvider *g_font_css_provider = NULL;
 
 /* Applies the current font size (see Ctrl+Plus/Minus/0 in
- * on_window_key_pressed) via CSS to all ".tfm-mono" widgets - like
- * apply_omarchy_theme(), removes the old provider first so they don't
- * stack. */
+ * on_window_key_pressed) via CSS to all ".tfm-mono" widgets - reloads the
+ * existing provider's content in place instead of destroying/recreating it
+ * on every Ctrl+Plus/Minus/0, same reasoning as apply_omarchy_theme(). */
 static void apply_font_size(void)
 {
     GdkDisplay *display = gdk_display_get_default();
     if (display == NULL) {
         return;
-    }
-    if (g_font_css_provider != NULL) {
-        gtk_style_context_remove_provider_for_display(display,
-                                                       GTK_STYLE_PROVIDER(g_font_css_provider));
-        g_object_unref(g_font_css_provider);
-        g_font_css_provider = NULL;
     }
 
     char css[256];
@@ -1317,10 +1396,12 @@ static void apply_font_size(void)
              ".tfm-mono { font-family: \"JetBrainsMono Nerd Font\", monospace; font-size: %gpt; }\n",
              g_font_size);
 
-    g_font_css_provider = gtk_css_provider_new();
+    if (g_font_css_provider == NULL) {
+        g_font_css_provider = gtk_css_provider_new();
+        gtk_style_context_add_provider_for_display(display, GTK_STYLE_PROVIDER(g_font_css_provider),
+                                                    GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    }
     gtk_css_provider_load_from_string(g_font_css_provider, css);
-    gtk_style_context_add_provider_for_display(display, GTK_STYLE_PROVIDER(g_font_css_provider),
-                                                GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
 }
 
 static gboolean on_window_key_pressed(GtkEventControllerKey *controller, guint keyval,
@@ -1391,7 +1472,8 @@ static gboolean on_window_key_pressed(GtkEventControllerKey *controller, guint k
      * having to click it first. */
     GtkWidget *current_focus = gtk_window_get_focus(window);
     if (current_focus != g_shell_entry &&
-        !(state & (GDK_CONTROL_MASK | GDK_ALT_MASK | GDK_META_MASK))) {
+        !(state & (GDK_CONTROL_MASK | GDK_ALT_MASK | GDK_META_MASK |
+                    GDK_SUPER_MASK | GDK_HYPER_MASK))) {
         gunichar ch = gdk_keyval_to_unicode(keyval);
         if (ch != 0 && g_unichar_isgraph(ch)) {
             char utf8[8];
@@ -1424,9 +1506,25 @@ static gboolean on_window_close_request(GtkWindow *window, gpointer user_data)
     (void)user_data;
 
     if (g_modal_depth > 0) {
-        show_error_dialog("Please wait",
-                           "An operation or dialog is still in progress. Please finish it "
-                           "before closing the window.");
+        /* show_error_dialog() itself pumps a nested main loop (see
+         * run_alert_dialog_blocking()), which keeps GTK's event dispatch
+         * running - a close-button click (or SUPER+Q) arriving again
+         * while THIS "Please wait" dialog is still up would re-enter this
+         * handler (g_modal_depth is still > 0, now incremented further by
+         * the dialog itself) and show a second "Please wait" dialog on
+         * top of the first, and so on for every repeated click. Guard
+         * with a dedicated static flag, separate from g_modal_depth
+         * (which must stay > 0 the whole time for this branch to keep
+         * firing at all), so a re-entrant call just refuses the close
+         * without stacking another dialog. */
+        static int showing_wait_dialog = 0;
+        if (!showing_wait_dialog) {
+            showing_wait_dialog = 1;
+            show_error_dialog("Please wait",
+                               "An operation or dialog is still in progress. Please finish it "
+                               "before closing the window.");
+            showing_wait_dialog = 0;
+        }
         return TRUE; /* refuse to close */
     }
 
@@ -1552,6 +1650,25 @@ static void on_shutdown(GApplication *app, gpointer user_data)
 
 int main(int argc, char **argv)
 {
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-v") == 0) {
+            printf("tfm-gui %s\n", TFM_VERSION);
+            return 0;
+        }
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("Usage: tfm-gui [--version] [--help]\n"
+                   "GTK4/libadwaita GUI file manager. Run with no arguments to start.\n");
+            return 0;
+        }
+    }
+
+    /* Called explicitly rather than relying on gtk_init()/adw_init()
+     * having already done it internally - dir.c's directory sort (shared
+     * with the TUI) needs the process locale set for case-folding and
+     * collation to be locale-aware rather than plain "C"-locale ASCII,
+     * and this must happen before the first panel is loaded below. */
+    setlocale(LC_ALL, "");
+
     config_load(&g_cfg);
     g_default_font_size = read_terminal_font_size();
     g_font_size = g_default_font_size;

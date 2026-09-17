@@ -45,9 +45,6 @@ void screen_show_cursor(void);
 /* Writes text to the line directly below the top border. */
 void screen_draw_menu_bar(const char *text);
 
-/* Writes text to the line directly above the bottom border. */
-void screen_draw_keybinding_bar(const char *text);
-
 typedef struct {
     const char *key;   /* e.g. "F5" */
     const char *label; /* e.g. "Copy" */
@@ -71,11 +68,8 @@ void screen_draw_popup(const char *title, const char *message);
 void screen_draw_box(int row, int col, int width, int height, const char *color_name);
 
 /* Writes text left-aligned at row/col, truncated/padded to max_width
- * characters. */
-void screen_print_at(int row, int col, int max_width, const char *text);
-
-/* Like screen_print_at, but colored with color_name ("system" = no
- * color, terminal default). */
+ * characters, colored with color_name ("system" = no color, terminal
+ * default). */
 void screen_print_at_colored(int row, int col, int max_width, const char *text, const char *color_name);
 
 /* Like screen_print_at_colored, but bold. */

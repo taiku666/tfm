@@ -161,7 +161,7 @@ void panel_draw(const Panel *panel, int row, int col, int width, int height, con
 
     screen_draw_hline(row + 2, col + 1, width - 2, theme->border_color);
 
-    int visible_rows = height - 4;
+    int visible_rows = height - PANEL_CHROME_ROWS;
     if (visible_rows < 0) {
         visible_rows = 0;
     }
@@ -177,7 +177,7 @@ void panel_draw(const Panel *panel, int row, int col, int width, int height, con
             const char *icon = icon_for_entry(entry->name, entry->is_dir, theme->icons_enabled);
             snprintf(text, sizeof(text), "%s %s%s", icon, entry->name, entry->is_dir ? "/" : "");
 
-            const char *entry_color = entry->is_dir ? "blue" : theme->text_color;
+            const char *entry_color = entry->is_dir ? theme->dir_color : theme->text_color;
 
             if (is_active && (int)idx == panel->selected_index) {
                 screen_print_at_selected(line_row, col + 1, width - 2, text, theme->cursor_color);

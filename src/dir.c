@@ -9,8 +9,41 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <wchar.h>
+#include <wctype.h>
 
 #include "tfm_common.h"
+
+/* Case-insensitive, locale-aware comparison of two UTF-8 filenames.
+ * strcasecmp() alone only ever does per-byte ASCII folding - even with
+ * setlocale(LC_ALL, "") called at startup (see main()), it doesn't
+ * decode multibyte UTF-8 sequences at all, so accented characters never
+ * fold ("Übung" and "übung" compare as unrelated byte sequences) and
+ * don't collate the way the active locale's alphabet expects. Converts
+ * to wide characters, case-folds each one with towlower(), then collates
+ * with wcscoll() (locale-aware ordering, not just codepoint value).
+ * Falls back to plain strcasecmp() if the multibyte conversion fails
+ * (e.g. invalid UTF-8, or no locale support installed) rather than
+ * comparing partially-converted, garbage wide strings. */
+static int compare_names_locale_aware(const char *a, const char *b)
+{
+    wchar_t wa[300];
+    wchar_t wb[300];
+    size_t na = mbstowcs(wa, a, sizeof(wa) / sizeof(wa[0]) - 1);
+    size_t nb = mbstowcs(wb, b, sizeof(wb) / sizeof(wb[0]) - 1);
+    if (na == (size_t)-1 || nb == (size_t)-1) {
+        return strcasecmp(a, b);
+    }
+    wa[na] = L'\0';
+    wb[nb] = L'\0';
+    for (size_t i = 0; i < na; i++) {
+        wa[i] = towlower(wa[i]);
+    }
+    for (size_t i = 0; i < nb; i++) {
+        wb[i] = towlower(wb[i]);
+    }
+    return wcscoll(wa, wb);
+}
 
 /* Sort order: ".." first, then directories alphabetically, then files alphabetically. */
 static int compare_entries(const void *a, const void *b)
@@ -28,15 +61,28 @@ static int compare_entries(const void *a, const void *b)
         return eb->is_dir - ea->is_dir;
     }
 
-    return strcasecmp(ea->name, eb->name);
+    return compare_names_locale_aware(ea->name, eb->name);
 }
 
 int dir_list(const char *path, DirEntryInfo **out_entries, size_t *out_count)
 {
+    /* Public API contract: out_entries/out_count are mandatory (every
+     * caller passes real, non-NULL out-params, but the contract wasn't
+     * ever actually enforced), and opendir(NULL) is undefined behavior,
+     * not a clean ENOENT-style failure - guard explicitly instead of
+     * relying on every future caller to check first. */
+    if (out_entries == NULL || out_count == NULL) {
+        return -1;
+    }
+
     /* Set to a defined empty state up front, in case a caller ignores the
      * return value on failure. */
     *out_entries = NULL;
     *out_count = 0;
+
+    if (path == NULL) {
+        return -1;
+    }
 
     DIR *dp = opendir(path);
     if (dp == NULL) {

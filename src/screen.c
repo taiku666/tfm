@@ -3,12 +3,14 @@
 #include <ctype.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 
 #include "input.h"
+#include "tfm_common.h"
 
 #define ANSI_RESET "\x1b[0m"
 
@@ -175,6 +177,21 @@ static void move_cursor(int row, int col)
     printf("\x1b[%d;%dH", row, col);
 }
 
+/* Draws one horizontal popup border edge (top or bottom) at row/col,
+ * box_width columns wide - the same "corner + N horizontals + corner"
+ * pattern was previously duplicated at four separate popup-drawing call
+ * sites (screen_draw_popup, draw_popup_frame, screen_draw_progress_popup,
+ * screen_prompt_buttons). */
+static void draw_popup_border_edge(int row, int col, int box_width, int is_top)
+{
+    move_cursor(row, col);
+    printf(is_top ? POPUP_TOP_LEFT : POPUP_BOTTOM_LEFT);
+    for (int c = 0; c < box_width - 2; c++) {
+        printf(POPUP_HORIZONTAL);
+    }
+    printf(is_top ? POPUP_TOP_RIGHT : POPUP_BOTTOM_RIGHT);
+}
+
 /* Blanks a rectangle with spaces - erases a popup box's previous
  * footprint before it's redrawn at a new size/position. */
 static void clear_rect(int start_row, int start_col, int height, int width)
@@ -268,16 +285,6 @@ void screen_draw_menu_bar(const char *text)
     fflush(stdout);
 }
 
-void screen_draw_keybinding_bar(const char *text)
-{
-    int rows, cols;
-    screen_get_size(&rows, &cols);
-
-    move_cursor(rows - 1, 2);
-    print_utf8_padded(text, cols - 2);
-    fflush(stdout);
-}
-
 void screen_draw_function_bar(const FunctionKey *keys, int count, const char *color_name)
 {
     int rows, cols;
@@ -347,19 +354,20 @@ void screen_draw_command_line(const char *prompt, const char *text)
     fflush(stdout);
 }
 
-void screen_draw_popup(const char *title, const char *message)
+/* Draws a centered 3-line popup (frame + 3 content lines) and returns the
+ * start row/col and available inner width. Shared base for the info,
+ * progress, and choice popups. */
+static void draw_popup_frame(const char *lines[3], int *out_start_row, int *out_start_col, int *out_inner_width)
 {
     int rows, cols;
     screen_get_size(&rows, &cols);
 
-    const char *hint = "Press any key to close";
-
-    int max_content = utf8_visual_width(title);
-    if (utf8_visual_width(message) > max_content) {
-        max_content = utf8_visual_width(message);
-    }
-    if (utf8_visual_width(hint) > max_content) {
-        max_content = utf8_visual_width(hint);
+    int max_content = 0;
+    for (int i = 0; i < 3; i++) {
+        int len = utf8_visual_width(lines[i]);
+        if (len > max_content) {
+            max_content = len;
+        }
     }
 
     int inner_width = max_content;
@@ -371,7 +379,7 @@ void screen_draw_popup(const char *title, const char *message)
         inner_width = max_inner_width;
     }
 
-    int box_width = inner_width + 4; /* border + space + content + space + border */
+    int box_width = inner_width + 4;
     int box_height = 5;
 
     int start_row = (rows - box_height) / 2;
@@ -383,14 +391,8 @@ void screen_draw_popup(const char *title, const char *message)
         start_col = 2;
     }
 
-    move_cursor(start_row, start_col);
-    printf(POPUP_TOP_LEFT);
-    for (int c = 0; c < box_width - 2; c++) {
-        printf(POPUP_HORIZONTAL);
-    }
-    printf(POPUP_TOP_RIGHT);
+    draw_popup_border_edge(start_row, start_col, box_width, 1);
 
-    const char *lines[3] = {title, message, hint};
     for (int i = 0; i < 3; i++) {
         move_cursor(start_row + 1 + i, start_col);
         printf(POPUP_VERTICAL " ");
@@ -398,13 +400,18 @@ void screen_draw_popup(const char *title, const char *message)
         printf(" " POPUP_VERTICAL);
     }
 
-    move_cursor(start_row + 4, start_col);
-    printf(POPUP_BOTTOM_LEFT);
-    for (int c = 0; c < box_width - 2; c++) {
-        printf(POPUP_HORIZONTAL);
-    }
-    printf(POPUP_BOTTOM_RIGHT);
+    draw_popup_border_edge(start_row + 4, start_col, box_width, 0);
 
+    *out_start_row = start_row;
+    *out_start_col = start_col;
+    *out_inner_width = inner_width;
+}
+
+void screen_draw_popup(const char *title, const char *message)
+{
+    const char *lines[3] = {title, message, "Press any key to close"};
+    int start_row, start_col, inner_width;
+    draw_popup_frame(lines, &start_row, &start_col, &inner_width);
     fflush(stdout);
 }
 
@@ -414,12 +421,7 @@ void screen_draw_box(int row, int col, int width, int height, const char *color_
 
     printf("%s", color_code);
 
-    move_cursor(row, col);
-    printf(POPUP_TOP_LEFT);
-    for (int c = 0; c < width - 2; c++) {
-        printf(POPUP_HORIZONTAL);
-    }
-    printf(POPUP_TOP_RIGHT);
+    draw_popup_border_edge(row, col, width, 1);
 
     for (int r = 1; r < height - 1; r++) {
         move_cursor(row + r, col);
@@ -428,21 +430,9 @@ void screen_draw_box(int row, int col, int width, int height, const char *color_
         printf(POPUP_VERTICAL);
     }
 
-    move_cursor(row + height - 1, col);
-    printf(POPUP_BOTTOM_LEFT);
-    for (int c = 0; c < width - 2; c++) {
-        printf(POPUP_HORIZONTAL);
-    }
-    printf(POPUP_BOTTOM_RIGHT);
+    draw_popup_border_edge(row + height - 1, col, width, 0);
 
     printf(ANSI_RESET);
-    fflush(stdout);
-}
-
-void screen_print_at(int row, int col, int max_width, const char *text)
-{
-    move_cursor(row, col);
-    print_utf8_padded(text, max_width);
     fflush(stdout);
 }
 
@@ -547,68 +537,6 @@ void screen_draw_border(const char *color_name, const char *title)
     fflush(stdout);
 }
 
-/* Draws a centered 3-line popup (frame + 3 content lines) and returns the
- * start row/col and available inner width. Shared base for the progress
- * and choice popups. */
-static void draw_popup_frame(const char *lines[3], int *out_start_row, int *out_start_col, int *out_inner_width)
-{
-    int rows, cols;
-    screen_get_size(&rows, &cols);
-
-    int max_content = 0;
-    for (int i = 0; i < 3; i++) {
-        int len = utf8_visual_width(lines[i]);
-        if (len > max_content) {
-            max_content = len;
-        }
-    }
-
-    int inner_width = max_content;
-    int max_inner_width = cols - 6;
-    if (max_inner_width < 10) {
-        max_inner_width = 10;
-    }
-    if (inner_width > max_inner_width) {
-        inner_width = max_inner_width;
-    }
-
-    int box_width = inner_width + 4;
-    int box_height = 5;
-
-    int start_row = (rows - box_height) / 2;
-    if (start_row < 2) {
-        start_row = 2;
-    }
-    int start_col = (cols - box_width) / 2;
-    if (start_col < 2) {
-        start_col = 2;
-    }
-
-    move_cursor(start_row, start_col);
-    printf(POPUP_TOP_LEFT);
-    for (int c = 0; c < box_width - 2; c++) {
-        printf(POPUP_HORIZONTAL);
-    }
-    printf(POPUP_TOP_RIGHT);
-
-    for (int i = 0; i < 3; i++) {
-        move_cursor(start_row + 1 + i, start_col);
-        printf(POPUP_VERTICAL " ");
-        print_utf8_padded(lines[i], inner_width);
-        printf(" " POPUP_VERTICAL);
-    }
-
-    move_cursor(start_row + 4, start_col);
-    printf(POPUP_BOTTOM_LEFT);
-    for (int c = 0; c < box_width - 2; c++) {
-        printf(POPUP_HORIZONTAL);
-    }
-    printf(POPUP_BOTTOM_RIGHT);
-
-    *out_start_row = start_row;
-    *out_start_col = start_col;
-    *out_inner_width = inner_width;
-}
 
 void screen_draw_progress_popup(const char *title, const char *item, double percent)
 {
@@ -728,12 +656,7 @@ void screen_draw_progress_popup(const char *title, const char *item, double perc
         start_col = 2;
     }
 
-    move_cursor(start_row, start_col);
-    printf(POPUP_TOP_LEFT);
-    for (int c = 0; c < box_width - 2; c++) {
-        printf(POPUP_HORIZONTAL);
-    }
-    printf(POPUP_TOP_RIGHT);
+    draw_popup_border_edge(start_row, start_col, box_width, 1);
 
     move_cursor(start_row + 1, start_col);
     printf(POPUP_VERTICAL " ");
@@ -750,12 +673,7 @@ void screen_draw_progress_popup(const char *title, const char *item, double perc
     print_utf8_padded(percent_line, inner_width);
     printf(ANSI_RESET " " POPUP_VERTICAL);
 
-    move_cursor(start_row + 4, start_col);
-    printf(POPUP_BOTTOM_LEFT);
-    for (int c = 0; c < box_width - 2; c++) {
-        printf(POPUP_HORIZONTAL);
-    }
-    printf(POPUP_BOTTOM_RIGHT);
+    draw_popup_border_edge(start_row + 4, start_col, box_width, 0);
 
     fflush(stdout);
 }
@@ -881,12 +799,7 @@ static int screen_prompt_buttons(const char *title, const char *message, const D
         prev_start_col = start_col;
         prev_box_width = box_width;
 
-        move_cursor(start_row, start_col);
-        printf(POPUP_TOP_LEFT);
-        for (int c = 0; c < box_width - 2; c++) {
-            printf(POPUP_HORIZONTAL);
-        }
-        printf(POPUP_TOP_RIGHT);
+        draw_popup_border_edge(start_row, start_col, box_width, 1);
 
         move_cursor(start_row + 1, start_col);
         printf(POPUP_VERTICAL " ");
@@ -903,12 +816,7 @@ static int screen_prompt_buttons(const char *title, const char *message, const D
         draw_button_row(inner_width, buttons, count, selected);
         printf(" " POPUP_VERTICAL);
 
-        move_cursor(start_row + 4, start_col);
-        printf(POPUP_BOTTOM_LEFT);
-        for (int c = 0; c < box_width - 2; c++) {
-            printf(POPUP_HORIZONTAL);
-        }
-        printf(POPUP_BOTTOM_RIGHT);
+        draw_popup_border_edge(start_row + 4, start_col, box_width, 0);
 
         fflush(stdout);
 
@@ -972,8 +880,18 @@ ScreenChoice screen_prompt_overwrite(const char *path)
 
 int screen_prompt_text(const char *title, char *buffer, size_t buffer_size)
 {
-    char edited[256];
-    snprintf(edited, sizeof(edited), "%s", buffer);
+    /* Sized to match the caller's own buffer instead of a fixed 256:
+     * previously any caller passing buffer_size > 256 (none currently do
+     * - entry names are capped at 255 bytes - but the contract allows
+     * it) would have a longer prefill silently truncated by this
+     * function's own internal buffer, independent of and smaller than
+     * what the caller actually asked for. */
+    size_t edit_capacity = buffer_size > 0 ? buffer_size : 1;
+    char *edited = malloc(edit_capacity);
+    if (edited == NULL) {
+        return 0;
+    }
+    snprintf(edited, edit_capacity, "%s", buffer);
     size_t len = strlen(edited);
 
     const char *hint = "Enter=OK  Esc=Cancel";
@@ -982,6 +900,7 @@ int screen_prompt_text(const char *title, char *buffer, size_t buffer_size)
      * Backspace - track the last-drawn footprint so it can be blanked
      * before the next draw, otherwise the old wider border lingers. */
     int prev_start_row = -1, prev_start_col = -1, prev_box_width = 0;
+    int result = 0;
 
     for (;;) {
         if (prev_start_row >= 0) {
@@ -1013,16 +932,20 @@ int screen_prompt_text(const char *title, char *buffer, size_t buffer_size)
         }
 
         if (key.type == KEY_ESC) {
-            return 0;
+            break;
         }
         if (key.type == KEY_CHAR) {
             if (key.ch == '\r' || key.ch == '\n') {
                 snprintf(buffer, buffer_size, "%s", edited);
-                return 1;
+                result = 1;
+                break;
             }
             if (key.ch == 127 || key.ch == 8) {
                 if (len > 0) {
-                    edited[--len] = '\0';
+                    /* Step back one UTF-8 codepoint, not one byte - see
+                     * the matching fix in main.c's command line. */
+                    len -= utf8_prev_char_len(edited, len);
+                    edited[len] = '\0';
                 }
             } else if ((unsigned char)key.ch >= 32 && key.ch != 127) {
                 /* key.ch is a signed char - UTF-8 continuation bytes of an
@@ -1030,13 +953,16 @@ int screen_prompt_text(const char *title, char *buffer, size_t buffer_size)
                  * as a signed char, but are still valid bytes to append one
                  * at a time (each arrives as its own KEY_CHAR from
                  * input_read_key()). */
-                if (len < sizeof(edited) - 1) {
+                if (len < edit_capacity - 1) {
                     edited[len++] = key.ch;
                     edited[len] = '\0';
                 }
             }
         }
     }
+
+    free(edited);
+    return result;
 }
 
 int screen_prompt_confirm(const char *title, const char *message)

@@ -20,8 +20,17 @@ typedef struct {
     const char *border_color;
     const char *text_color;
     const char *cursor_color;
+    const char *dir_color;
     int icons_enabled; /* 1 = Nerd Font icons (omarchy), 0 = name only */
 } PanelTheme;
+
+/* Non-content rows in a panel_draw() box: top border + path line + header
+ * separator + bottom border. Both panel_draw() itself (to compute how many
+ * entry rows fit) and any caller that needs to know the same thing ahead of
+ * time (e.g. main.c's panel_visible_rows(), for scrolling math before the
+ * next draw) must agree on this number - previously two independent literal
+ * `4`s that had to be kept in sync by hand. */
+#define PANEL_CHROME_ROWS 4
 
 /* Initializes panel with path and loads its contents. */
 void panel_init(Panel *panel, const char *path);

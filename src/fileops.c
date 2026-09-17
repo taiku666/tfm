@@ -13,6 +13,17 @@
 
 #include "tfm_common.h"
 
+/* Ceiling on directory-tree recursion depth for compute_total_size(),
+ * copy_recursive(), and delete_recursive(). All three recurse one stack
+ * frame per directory level with no depth check, so a sufficiently deep
+ * tree (rare, but not impossible - a deeply nested build cache, or a
+ * maliciously/accidentally constructed tree) could exhaust the stack and
+ * crash instead of failing cleanly. copy_recursive()'s frame alone holds
+ * three PATH_MAX (4096-byte) buffers, so even a generous limit here still
+ * leaves a comfortable margin below a real overflow on the default 8MB
+ * stack. */
+#define MAX_RECURSION_DEPTH 200
+
 typedef struct {
     long long total_bytes;
     long long copied_bytes;
@@ -61,8 +72,18 @@ static void report_progress(const FileOpCallbacks *cb, const char *title, const 
  * before any visible progress, and in the GUI the window appeared frozen
  * because g_main_context_iteration() is only pumped inside on_progress
  * (see gui_fileop_on_progress), which wasn't called during this pass. */
-static long long compute_total_size(const char *path, const FileOpCallbacks *cb)
+static long long compute_total_size_impl(const char *path, const FileOpCallbacks *cb, int depth)
 {
+    /* Same "just an estimate, fail soft" treatment as an opendir()
+     * failure below - a tree deep enough to hit this is already an edge
+     * case for a progress-percent pre-pass, not worth surfacing a dialog
+     * over. copy_recursive()/delete_recursive() (below) hit the real data
+     * they operate on, so THEY report this instead of silently
+     * undercounting. */
+    if (depth > MAX_RECURSION_DEPTH) {
+        return 0;
+    }
+
     struct stat st;
     /* lstat, not stat: a directory symlink pointing at an ancestor or
      * itself would otherwise recurse into stat() forever (stack overflow). */
@@ -88,12 +109,17 @@ static long long compute_total_size(const char *path, const FileOpCallbacks *cb)
         }
         char child[PATH_MAX];
         if (path_join(child, sizeof(child), path, entry->d_name)) {
-            total += compute_total_size(child, cb);
+            total += compute_total_size_impl(child, cb, depth + 1);
         }
     }
 
     closedir(dp);
     return total;
+}
+
+static long long compute_total_size(const char *path, const FileOpCallbacks *cb)
+{
+    return compute_total_size_impl(path, cb, 0);
 }
 
 /* Forward declaration: copy_file() needs to remove an existing destination
@@ -122,6 +148,12 @@ static int copy_file(const char *src_path, const char *dest_path, CopyProgress *
         }
     }
 
+    /* Stat src_path once up front and reuse it below both for the
+     * same-inode check and for the post-copy fchmod() - avoids re-stat()ing
+     * a path that hasn't changed between the two uses. */
+    struct stat src_st;
+    int have_src_st = (stat(src_path, &src_st) == 0);
+
     struct stat existing;
     if (lstat(dest_path, &existing) == 0) {
         /* src_path and dest_path can be different strings referring to the
@@ -129,8 +161,7 @@ static int copy_file(const char *src_path, const char *dest_path, CopyProgress *
          * strcmp() above misses. fopen(dest_path, "wb") would still
          * truncate it to 0 bytes while it's open for reading via "in" -
          * silent, irreversible data loss. Compare by inode to catch this. */
-        struct stat src_st;
-        if (stat(src_path, &src_st) == 0) {
+        if (have_src_st) {
             struct stat dest_real = existing;
             if (S_ISLNK(existing.st_mode)) {
                 stat(dest_path, &dest_real);
@@ -205,7 +236,17 @@ static int copy_file(const char *src_path, const char *dest_path, CopyProgress *
          * prompt (TOCTOU) would otherwise be followed and its target
          * truncated by a Retry's O_TRUNC open. */
         int open_flags = O_WRONLY | O_CREAT | O_NOFOLLOW | (dest_created ? O_TRUNC : O_EXCL);
-        int dest_fd = open(dest_path, open_flags, 0666);
+        /* 0600, not 0666: the file's permissions are only finalized to
+         * the source's real mode by fchmod() below AFTER the copy
+         * completes - creating it at the permissive default in the
+         * meantime would leave a private source file (e.g. a 0600 SSH
+         * key) briefly world-readable-minus-umask while its content is
+         * still being written, and permanently so if the process is
+         * killed mid-copy before the fchmod() runs. Narrow-then-widen is
+         * the safe direction: a source file that's actually MORE
+         * permissive than 0600 still ends up correctly widened by the
+         * fchmod() at the end, it just isn't briefly too-open first. */
+        int dest_fd = open(dest_path, open_flags, 0600);
         FILE *out = (dest_fd != -1) ? fdopen(dest_fd, "wb") : NULL;
         if (out == NULL) {
             if (dest_fd != -1) {
@@ -266,10 +307,43 @@ static int copy_file(const char *src_path, const char *dest_path, CopyProgress *
              * SSH key) ends up 0644 (world-readable) under a typical
              * umask. Masked to 0777 (not 07777): setuid/setgid on a
              * regular file must never be carried over to a copy made by
-             * a different, possibly unprivileged, owner. */
-            struct stat src_mode_st;
-            if (stat(src_path, &src_mode_st) == 0) {
-                fchmod(fileno(out), src_mode_st.st_mode & 0777);
+             * a different, possibly unprivileged, owner. Reuses the
+             * src_st already stat()'d at the top of this function instead
+             * of re-stat()ing the same unchanged path. */
+            if (have_src_st) {
+                /* fwrite() above is buffered in userspace - without this
+                 * flush, the buffered bytes are still unwritten at the
+                 * kernel level when futimens() runs below, and the
+                 * eventual real write() (triggered by the fclose() calls
+                 * further down) bumps mtime back to "now" as an ordinary
+                 * side effect of writing data, silently undoing the
+                 * timestamp restore. Caught by testing the actual copied
+                 * file's timestamp, not just futimens()'s return value
+                 * (which reports success either way). */
+                fflush(out);
+
+                fchmod(fileno(out), src_st.st_mode & 0777);
+
+                /* Best-effort: fchown() to the source's owner/group only
+                 * succeeds for root (CAP_CHOWN) or when the caller is
+                 * already a member of the target group - for a normal,
+                 * unprivileged user copying their own files this is a
+                 * harmless no-op (they already own the new file), but
+                 * for a root-run backup/restore it preserves ownership
+                 * instead of silently reassigning everything to root.
+                 * Failure (EPERM) is expected and ignored - there is no
+                 * Retry/Skip/Abort question to ask the user here, this is
+                 * metadata preservation, not the operation itself. */
+                fchown(fileno(out), src_st.st_uid, src_st.st_gid);
+
+                /* Best-effort: preserve mtime/atime so a copy doesn't
+                 * look "just modified" (breaks incremental-backup tools,
+                 * build-cache freshness checks, and just plain misleads
+                 * the user about when a file was actually last changed). */
+                struct timespec times[2];
+                times[0] = src_st.st_atim;
+                times[1] = src_st.st_mtim;
+                futimens(fileno(out), times);
             }
         }
 
@@ -337,9 +411,24 @@ static int remove_existing_for_overwrite(const char *dest, const struct stat *de
 /* Copies src (file or directory) recursively to dest. Returns 1 to
  * continue, 0 if aborted. See copy_file()'s comment for what had_skip is
  * for and why every SKIP exit below sets it instead of just returning 1. */
-static int copy_recursive(const char *src, const char *dest, CopyProgress *progress,
-                           const FileOpCallbacks *cb, int *had_skip)
+static int copy_recursive_impl(const char *src, const char *dest, CopyProgress *progress,
+                                const FileOpCallbacks *cb, int *had_skip, int depth)
 {
+    if (depth > MAX_RECURSION_DEPTH) {
+        /* Unlike compute_total_size_impl()'s "just an estimate" case,
+         * this function is about to actually copy real data - fail
+         * loudly through the normal Retry/Skip/Abort machinery instead
+         * of silently stopping partway (Retry can't help here - the
+         * tree's depth won't change - but the choice is still routed
+         * through so the caller sees a consistent contract). */
+        FileOpChoice choice = report_error(cb, "Directory tree too deep", src);
+        if (choice == FILEOPS_CHOICE_SKIP) {
+            *had_skip = 1;
+            return 1;
+        }
+        return 0;
+    }
+
     struct stat st;
     /* lstat, not stat: handle symlinks themselves (copy as a link) rather
      * than following them, so a directory symlink pointing at an ancestor
@@ -455,6 +544,13 @@ static int copy_recursive(const char *src, const char *dest, CopyProgress *progr
          * downgrade of a deliberately set permission via merge). */
         if (mkdir(dest, st.st_mode & 07777) == 0) {
             chmod(dest, st.st_mode & 07777);
+            /* Best-effort, same reasoning as copy_file()'s fchown() -
+             * harmless no-op for a normal user, preserves ownership for
+             * a root-run backup/restore. Directory mtime is deliberately
+             * NOT restored here: it will be repeatedly overwritten as
+             * this directory's own entries are copied into it below, so
+             * setting it now would just be discarded. */
+            chown(dest, st.st_uid, st.st_gid);
             break;
         }
         if (errno == EEXIST) {
@@ -554,7 +650,7 @@ static int copy_recursive(const char *src, const char *dest, CopyProgress *progr
                 return 0;
             }
 
-            if (!copy_recursive(child_src, child_dest, progress, cb, had_skip)) {
+            if (!copy_recursive_impl(child_src, child_dest, progress, cb, had_skip, depth + 1)) {
                 closedir(dp);
                 return 0;
             }
@@ -582,6 +678,12 @@ static int copy_recursive(const char *src, const char *dest, CopyProgress *progr
 
     closedir(dp);
     return 1;
+}
+
+static int copy_recursive(const char *src, const char *dest, CopyProgress *progress,
+                           const FileOpCallbacks *cb, int *had_skip)
+{
+    return copy_recursive_impl(src, dest, progress, cb, had_skip, 0);
 }
 
 /* Checks whether dir equals src or (resolved via realpath, so symlink
@@ -718,12 +820,26 @@ void fileops_copy(const char *src, const char *dest_dir, const FileOpCallbacks *
  * instead of silently ignoring failures - important for trees with
  * read-only or inaccessible sub-entries. Returns 1 to continue, 0 if
  * aborted. */
-static int delete_recursive(const char *path, const FileOpCallbacks *cb)
+static int delete_recursive_impl(const char *path, const FileOpCallbacks *cb, int depth)
 {
+    if (depth > MAX_RECURSION_DEPTH) {
+        /* See the matching check/comment in copy_recursive_impl(). */
+        FileOpChoice choice = report_error(cb, "Directory tree too deep", path);
+        return choice == FILEOPS_CHOICE_SKIP;
+    }
+
     struct stat st;
     for (;;) {
         if (lstat(path, &st) == 0) {
             break;
+        }
+        if (errno == ENOENT) {
+            /* Already gone (e.g. removed by another process between the
+             * caller listing it and this call) - the goal of "path no
+             * longer exists" is already met, so treat this as success
+             * instead of looping Retry forever against an entry that will
+             * never come back. */
+            return 1;
         }
         FileOpChoice choice = report_error(cb, "Error", path);
         if (choice == FILEOPS_CHOICE_RETRY) {
@@ -764,7 +880,7 @@ static int delete_recursive(const char *path, const FileOpCallbacks *cb)
                     closedir(dp);
                     return 0;
                 }
-                if (!delete_recursive(child, cb)) {
+                if (!delete_recursive_impl(child, cb, depth + 1)) {
                     closedir(dp);
                     return 0;
                 }
@@ -794,6 +910,10 @@ static int delete_recursive(const char *path, const FileOpCallbacks *cb)
             if (rmdir(path) == 0) {
                 return 1;
             }
+            if (errno == ENOENT) {
+                /* Same race as above: already gone is success. */
+                return 1;
+            }
             FileOpChoice choice = report_error(cb, "Cannot remove directory", path);
             if (choice == FILEOPS_CHOICE_RETRY) {
                 continue;
@@ -806,12 +926,21 @@ static int delete_recursive(const char *path, const FileOpCallbacks *cb)
         if (unlink(path) == 0) {
             return 1;
         }
+        if (errno == ENOENT) {
+            /* Same race as the lstat() above: already gone is success. */
+            return 1;
+        }
         FileOpChoice choice = report_error(cb, "Cannot delete file", path);
         if (choice == FILEOPS_CHOICE_RETRY) {
             continue;
         }
         return choice == FILEOPS_CHOICE_SKIP;
     }
+}
+
+static int delete_recursive(const char *path, const FileOpCallbacks *cb)
+{
+    return delete_recursive_impl(path, cb, 0);
 }
 
 void fileops_move(const char *src, const char *dest_dir, const FileOpCallbacks *cb)
@@ -914,8 +1043,16 @@ void fileops_move(const char *src, const char *dest_dir, const FileOpCallbacks *
                      * parts are now safe to remove. */
                     report_error(cb, "Move incomplete",
                                  "Some files were skipped and were not moved; source left in place.");
-                } else {
-                    delete_recursive(src, cb);
+                } else if (!delete_recursive(src, cb)) {
+                    /* copy_recursive() succeeded fully (had_skip == 0) but
+                     * the source-side delete itself failed or was
+                     * aborted (e.g. a read-only source entry) - without
+                     * this check the function returned as if the move
+                     * had fully succeeded, leaving both the copy and the
+                     * un-deleted source on disk with no indication
+                     * anything was left behind. */
+                    report_error(cb, "Move incomplete",
+                                 "Copied, but could not remove the original; source left in place.");
                 }
             }
             return;
@@ -955,8 +1092,13 @@ void fileops_move(const char *src, const char *dest_dir, const FileOpCallbacks *
              * delete source entries that were never actually copied. */
             report_error(cb, "Move incomplete",
                          "Some files were skipped and were not moved; source left in place.");
-        } else {
-            delete_recursive(src, cb);
+        } else if (!delete_recursive(src, cb)) {
+            /* Same gap as the dir-merge branch above: the cross-fs copy
+             * fully succeeded but deleting the now-redundant source
+             * failed/was aborted - report it instead of returning
+             * silently as if the move had fully completed. */
+            report_error(cb, "Move incomplete",
+                         "Copied, but could not remove the original; source left in place.");
         }
     }
 }

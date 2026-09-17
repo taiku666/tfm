@@ -21,7 +21,16 @@ typedef enum {
     KEY_DOWN,
     KEY_LEFT,
     KEY_RIGHT,
-    KEY_UNKNOWN
+    KEY_HOME,
+    KEY_END,
+    KEY_PGUP,
+    KEY_PGDN,
+    KEY_INSERT,
+    KEY_DELETE,
+    KEY_SHIFT_TAB,
+    KEY_UNKNOWN,
+    KEY_EOF /* stdin closed (e.g. `tfm < /dev/null`) - not a recoverable
+             * condition, unlike KEY_NONE's transient "no key yet". */
 } KeyType;
 
 typedef struct {
@@ -43,12 +52,5 @@ KeyEvent input_read_key(void);
  * the last call, else 0. Lets both the main loop and blocking popup
  * dialogs (screen.c) react to a resize. */
 int input_consume_resize_flag(void);
-
-/* Like input_read_key(), for "wait for any key" call sites (popup
- * confirmation etc.) that ignore the return value: also consumes a
- * resize flag set by SIGWINCH during the wait, so it isn't left for
- * main.c's loop to misread as "just a resize" (see
- * input_consume_resize_flag()). */
-void input_wait_any_key(void);
 
 #endif

@@ -10,7 +10,8 @@ typedef struct {
 
 /* Reads the contents of path into a malloc'd array of DirEntryInfo.
  * *out_entries must later be freed with dir_list_free(). Returns 0 on
- * success, -1 on error. */
+ * success, -1 on error (including a NULL path, or NULL out_entries/
+ * out_count - the latter two are mandatory, unlike path). */
 int dir_list(const char *path, DirEntryInfo **out_entries, size_t *out_count);
 
 /* Frees an array produced by dir_list(). */

@@ -3,6 +3,7 @@
 #include "shell.h"
 
 #include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <time.h>
 #include <unistd.h>
@@ -42,7 +43,7 @@ int shell_execute_cb(const char *command, const char *cwd, void (*pump)(void *ct
         } while (result == -1 && errno == EINTR);
     } else {
         for (;;) {
-            result = waitpid(pid, &status, WNOHANG);
+            result = waitpid(pid, &status, WNOHANG | WUNTRACED);
             if (result == -1) {
                 if (errno == EINTR) {
                     /* Interrupted by a signal (e.g. SIGWINCH, installed
@@ -51,14 +52,50 @@ int shell_execute_cb(const char *command, const char *cwd, void (*pump)(void *ct
                      * which would leak a zombie. */
                     continue;
                 }
+                /* Any other waitpid() failure on a pid we just fork()ed
+                 * (realistically only ECHILD, meaning the child no
+                 * longer exists to wait for - there is no signal handler
+                 * anywhere in this process that could have reaped it
+                 * behind our back, so this means it's already gone, not
+                 * that a zombie was left behind). Nothing left to wait
+                 * for either way. */
                 break;
             }
             if (result != 0) {
+                if (WIFSTOPPED(status)) {
+                    /* WUNTRACED above makes a stopped child (e.g. an
+                     * external `kill -STOP <pid>`, or a command that
+                     * suspends itself) visible instead of invisible to
+                     * WNOHANG - without it, this loop would just keep
+                     * polling and pumping forever with no indication
+                     * anything unusual happened, since waitpid() never
+                     * reports a state change for a merely-stopped child.
+                     * tfm has no job-control model (no fg/bg for the
+                     * shell bar), so there is no sensible "leave it
+                     * stopped" outcome here - resume it and keep waiting
+                     * for a real exit, same as a shell resuming a
+                     * background job that gets suspended by the
+                     * terminal driver. */
+                    kill(pid, SIGCONT);
+                    pump(pump_ctx);
+                    struct timespec ts = {0, 20000000L};
+                    while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {
+                        /* Retry with the remaining time instead of
+                         * dropping it and looping back to waitpid()
+                         * immediately - a frequent signal source (e.g.
+                         * repeated resizes) would otherwise turn this
+                         * into a tight spin instead of the intended
+                         * ~50Hz poll rate. */
+                    }
+                    continue;
+                }
                 break;
             }
             pump(pump_ctx);
             struct timespec ts = {0, 20000000L};
-            nanosleep(&ts, NULL);
+            while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {
+                /* See the matching comment in the WIFSTOPPED branch above. */
+            }
         }
     }
 

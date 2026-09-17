@@ -3,6 +3,7 @@
 #include "splash.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,7 +22,14 @@ static void sleep_ms(int ms)
     struct timespec ts;
     ts.tv_sec = ms / 1000;
     ts.tv_nsec = (ms % 1000) * 1000000L;
-    nanosleep(&ts, NULL);
+    /* Loop on the remaining time instead of a single nanosleep() call: a
+     * signal (e.g. SIGWINCH from a resize during the animation) cuts the
+     * sleep short and returns the unslept remainder in ts - dropping it
+     * would make each interrupted frame's dwell time shorter than
+     * intended, visibly speeding up the animation during a resize-heavy
+     * startup instead of just redrawing at the same pace. */
+    while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {
+    }
 }
 
 static void get_term_size(int *rows, int *cols)
@@ -79,9 +87,58 @@ static const char *const *get_glyph(char ch)
     return fallback;
 }
 
+/* Byte length of the UTF-8 character starting at s[0] (1 for ASCII or an
+ * invalid/continuation lead byte - never overruns since every glyph is
+ * ASCII-only anyway and an unrecognized character falls back to a single
+ * dot regardless of its true width). Kept local rather than shared with
+ * screen.c's own UTF-8 helpers to keep splash.c a standalone, zero-
+ * build-coupling module (see its header comment). */
+static int utf8_char_len(unsigned char lead)
+{
+    if ((lead & 0x80) == 0x00) {
+        return 1;
+    }
+    if ((lead & 0xE0) == 0xC0) {
+        return 2;
+    }
+    if ((lead & 0xF0) == 0xE0) {
+        return 3;
+    }
+    if ((lead & 0xF8) == 0xF0) {
+        return 4;
+    }
+    return 1;
+}
+
+/* Visible column count of a UTF-8 string (one column per codepoint,
+ * counting each multi-byte character once rather than once per byte) -
+ * used to center the subtitle. Currently unreachable in the same sense
+ * as build_big_text()'s codepoint counting above (the only call site
+ * passes a hardcoded ASCII subtitle), but a future non-ASCII subtitle
+ * would otherwise be centered using its byte length instead of its
+ * displayed width, shifting it off-center by one column per multi-byte
+ * character. */
+static int utf8_visual_width(const char *text)
+{
+    int n = 0;
+    for (const char *p = text; *p != '\0'; n++) {
+        p += utf8_char_len((unsigned char)*p);
+    }
+    return n;
+}
+
 static int build_big_text(const char *text, char rows_out[FONT_H][MAX_BIG_TEXT])
 {
-    int n = (int)strlen(text);
+    /* Count codepoints, not bytes: text[i] used to be indexed byte-by-byte,
+     * so a single multi-byte UTF-8 character (e.g. an umlaut) rendered as
+     * several dot-fallback glyphs instead of one. Currently unreachable
+     * (the only call site passes a hardcoded ASCII title), fixed so a
+     * future non-ASCII title renders one glyph per character. */
+    int n = 0;
+    for (const char *p = text; *p != '\0'; n++) {
+        p += utf8_char_len((unsigned char)*p);
+    }
+
     int width = n > 0 ? n * (FONT_W + 1) - 1 : 0;
     if (width >= MAX_BIG_TEXT) {
         width = MAX_BIG_TEXT - 1;
@@ -92,15 +149,21 @@ static int build_big_text(const char *text, char rows_out[FONT_H][MAX_BIG_TEXT])
         rows_out[r][width] = '\0';
     }
 
+    const char *p = text;
     for (int i = 0; i < n; i++) {
         int offset = i * (FONT_W + 1);
+        int char_len = utf8_char_len((unsigned char)*p);
         if (offset + FONT_W > width) {
             break;
         }
-        const char *const *glyph = get_glyph(text[i]);
+        /* Any multi-byte character falls back to the dot glyph (the font
+         * table only defines ASCII letters/digits/space) instead of being
+         * matched byte-by-byte against single-byte table entries. */
+        const char *const *glyph = (char_len == 1) ? get_glyph(*p) : get_glyph('\0');
         for (int r = 0; r < FONT_H; r++) {
             memcpy(&rows_out[r][offset], glyph[r], FONT_W);
         }
+        p += char_len;
     }
 
     return width;
@@ -152,7 +215,7 @@ void splash_show(const char *title, const char *subtitle)
     static char big_rows[FONT_H][MAX_BIG_TEXT];
     int big_width = build_big_text(title, big_rows);
 
-    int subtitle_len = (int)strlen(subtitle);
+    int subtitle_len = utf8_visual_width(subtitle);
 
     int title_top_row = rows / 2 - FONT_H;
     if (title_top_row < 1) {

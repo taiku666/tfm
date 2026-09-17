@@ -1,6 +1,7 @@
 #define _DEFAULT_SOURCE
 
 #include <errno.h>
+#include <locale.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,6 +22,11 @@
 
 #define CMD_BUFFER_SIZE 256
 #define CMD_PROMPT "$ "
+
+/* Shared size for the various short one-line messages built in this file
+ * (synthetic "cd <name>" commands, popup/confirm text) - was previously
+ * three separate literal 300s that had to be kept in sync by hand. */
+#define TUI_MSG_BUFFER_SIZE 300
 
 typedef enum {
     FOCUS_LEFT,
@@ -57,7 +63,7 @@ static void compute_layout(Layout *layout)
 
 static int panel_visible_rows(const Layout *layout)
 {
-    int visible = layout->panel_height - 4;
+    int visible = layout->panel_height - PANEL_CHROME_ROWS;
     return visible < 0 ? 0 : visible;
 }
 
@@ -71,6 +77,7 @@ static void redraw_ui(const Config *cfg, const Panel *left, const Panel *right, 
     theme.border_color = cfg->panel_border_color;
     theme.text_color = cfg->text_color;
     theme.cursor_color = cfg->cursor_color;
+    theme.dir_color = cfg->dir_color;
     theme.icons_enabled = strcasecmp(cfg->icons, "omarchy") == 0;
 
     static const FunctionKey FUNCTION_KEYS[] = {
@@ -92,12 +99,32 @@ static void redraw_ui(const Config *cfg, const Panel *left, const Panel *right, 
 }
 
 /* Shared hide-draw-wait-show pattern for info/error popups, previously
- * duplicated at many call sites. */
+ * duplicated at many call sites.
+ *
+ * Loops and redraws on resize instead of drawing once and calling
+ * input_wait_any_key(): the latter silently consumes a SIGWINCH during
+ * the wait without redrawing anything, so a resize while this popup is up
+ * used to leave it on screen at its old, now wrong, size/position until
+ * dismissed - unlike screen_prompt_buttons()/screen_prompt_text(), which
+ * already redraw themselves on every resize. */
 static void tui_show_popup(const char *title, const char *message)
 {
     screen_hide_cursor();
-    screen_draw_popup(title, message);
-    input_wait_any_key();
+    for (;;) {
+        screen_draw_popup(title, message);
+
+        KeyEvent key = input_read_key();
+        if (key.type == KEY_EOF) {
+            break;
+        }
+        if (input_consume_resize_flag()) {
+            continue;
+        }
+        if (key.type == KEY_NONE) {
+            continue;
+        }
+        break;
+    }
     screen_show_cursor();
 }
 
@@ -132,7 +159,7 @@ static int enter_selected_entry(Panel *panel, char *error_msg, size_t error_msg_
         return 0;
     }
 
-    char synthetic_cmd[300];
+    char synthetic_cmd[TUI_MSG_BUFFER_SIZE];
     snprintf(synthetic_cmd, sizeof(synthetic_cmd), "cd %s", entry->name);
 
     if (!builtin_cd(panel->path, synthetic_cmd, error_msg, error_msg_size)) {
@@ -223,8 +250,29 @@ static void install_terminating_signal_handlers(void)
     signal(SIGPIPE, SIG_IGN);
 }
 
-int main(void)
+int main(int argc, char *argv[])
 {
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-v") == 0) {
+            printf("tfm %s\n", TFM_VERSION);
+            return 0;
+        }
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("Usage: tfm [--version] [--help]\n"
+                   "Dual-panel terminal file manager. Run with no arguments to start.\n");
+            return 0;
+        }
+    }
+
+    /* Without this, every locale-sensitive libc call (case folding,
+     * collation order in dir.c's directory sort) runs in the default "C"
+     * locale regardless of the user's actual environment - e.g. accented
+     * filenames never case-fold or collate the way the user's own
+     * alphabet expects. Failure (an unset/invalid LC_* env var) is not
+     * fatal: the C library simply keeps whatever locale was already
+     * active (normally "C"), same as never having called this. */
+    setlocale(LC_ALL, "");
+
     install_terminating_signal_handlers();
 
     screen_enter_alt_screen();
@@ -284,6 +332,7 @@ int main(void)
             {"panel_border_color", cfg.panel_border_color},
             {"text_color", cfg.text_color},
             {"cursor_color", cfg.cursor_color},
+            {"dir_color", cfg.dir_color},
         };
         char invalid_msg[256] = "";
         int any_invalid = 0;
@@ -308,7 +357,7 @@ int main(void)
              * (colorless) name despite this warning saying it was fixed. */
             screen_set_progress_bar_color(cfg.border_color);
 
-            char full_msg[300];
+            char full_msg[TUI_MSG_BUFFER_SIZE];
             snprintf(full_msg, sizeof(full_msg), "Unknown color in tfm.ini: %s (using system)", invalid_msg);
             tui_show_popup("Config warning", full_msg);
             redraw_ui(&cfg, &panel_left, &panel_right, focus, cmd_buffer);
@@ -332,9 +381,26 @@ int main(void)
             break;
         }
 
+        if (key.type == KEY_EOF) {
+            /* Stdin permanently closed (e.g. `tfm < /dev/null`) - exit
+             * through the normal loop-end path below instead of spinning
+             * forever re-reading an fd that will never produce a key. */
+            break;
+        }
+
         if (input_consume_resize_flag()) {
             redraw_ui(&cfg, &panel_left, &panel_right, focus, cmd_buffer);
-            continue;
+            /* A resize (SIGWINCH) can be flagged at the same time a real
+             * key was already successfully read (input_read_key()'s
+             * read() completing right before the signal, or the flag
+             * being set by an earlier, still-unconsumed resize) - only
+             * skip dispatch when there is genuinely no key to dispatch
+             * (KEY_NONE, e.g. the EINTR-aborted read that often
+             * accompanies the signal itself), instead of unconditionally
+             * discarding whatever key was read this iteration. */
+            if (key.type == KEY_NONE) {
+                continue;
+            }
         }
 
         Panel *active_panel = (focus == FOCUS_RIGHT) ? &panel_right : &panel_left;
@@ -462,7 +528,7 @@ int main(void)
             if (active_panel->count > 0) {
                 const DirEntryInfo *entry = &active_panel->entries[active_panel->selected_index];
                 if (strcmp(entry->name, "..") != 0) {
-                    char confirm_msg[300];
+                    char confirm_msg[TUI_MSG_BUFFER_SIZE];
                     snprintf(confirm_msg, sizeof(confirm_msg), "Delete %s%s?", entry->name,
                              entry->is_dir ? "/" : "");
 
@@ -472,8 +538,7 @@ int main(void)
                     if (confirmed) {
                         char target_path[PATH_MAX];
                         if (!path_join(target_path, sizeof(target_path), active_panel->path, entry->name)) {
-                            screen_draw_popup("Error", "Path too long");
-                            input_wait_any_key();
+                            tui_show_popup("Error", "Path too long");
                         } else {
                             fileops_delete(target_path, &tui_fileop_callbacks);
                             /* See comment at F5/fileops_copy(). */
@@ -602,7 +667,12 @@ int main(void)
             }
         } else if (key.type == KEY_CHAR && (key.ch == 127 || key.ch == 8)) {
             if (cmd_len > 0) {
-                cmd_buffer[--cmd_len] = '\0';
+                /* Step back one UTF-8 codepoint, not one byte - removing
+                 * only the last byte of a multi-byte character (e.g. an
+                 * umlaut) would leave a dangling continuation byte in the
+                 * buffer. */
+                cmd_len -= utf8_prev_char_len(cmd_buffer, cmd_len);
+                cmd_buffer[cmd_len] = '\0';
                 screen_draw_command_line(CMD_PROMPT, cmd_buffer);
             }
         } else if (key.type == KEY_CHAR && (unsigned char)key.ch >= 32 && key.ch != 127) {

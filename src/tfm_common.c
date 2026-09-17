@@ -3,6 +3,7 @@
 #include "tfm_common.h"
 
 #include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,6 +11,13 @@
 
 int path_join(char *out, size_t out_size, const char *dir, const char *name)
 {
+    /* Public shared helper, called from several places with a
+     * caller-controlled dir/name - a NULL here would reach snprintf()'s
+     * "%s" and either crash or (on a libc that tolerates it) print
+     * "(null)" into a path used for a real filesystem operation. */
+    if (out == NULL || dir == NULL || name == NULL) {
+        return 0;
+    }
     int n = snprintf(out, out_size, "%s/%s", dir, name);
     return n > 0 && (size_t)n < out_size;
 }
@@ -54,14 +62,35 @@ int builtin_cd(char *current_dir, const char *command, char *error_msg, size_t e
 
     char resolved[PATH_MAX];
     if (realpath(raw_path, resolved) == NULL) {
+        /* Every realpath() failure used to collapse into the same
+         * generic "Directory not found", regardless of the real reason
+         * (ENOENT: doesn't exist; EACCES: a parent component isn't
+         * searchable; ENAMETOOLONG: a component too long; ELOOP: a
+         * symlink cycle) - strerror() distinguishes them for the user
+         * instead of always implying "just doesn't exist" for cases
+         * that are actually a permissions or path problem. Captured
+         * immediately after the failing call, before any other libc
+         * call (even snprintf() below) could clobber errno. */
+        int saved_errno = errno;
         if (error_msg != NULL) {
-            snprintf(error_msg, error_msg_size, "Directory not found");
+            snprintf(error_msg, error_msg_size, "Cannot cd to \"%s\": %s", raw_path,
+                     strerror(saved_errno));
         }
         return 0;
     }
 
     struct stat st;
-    if (stat(resolved, &st) != 0 || !S_ISDIR(st.st_mode)) {
+    if (stat(resolved, &st) != 0) {
+        int saved_errno = errno;
+        if (error_msg != NULL) {
+            snprintf(error_msg, error_msg_size, "Cannot cd to \"%s\": %s", resolved,
+                     strerror(saved_errno));
+        }
+        return 0;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        /* stat() itself succeeded here - there is no errno to report,
+         * "Not a directory" is already the precise, accurate reason. */
         if (error_msg != NULL) {
             snprintf(error_msg, error_msg_size, "Not a directory");
         }
@@ -74,8 +103,15 @@ int builtin_cd(char *current_dir, const char *command, char *error_msg, size_t e
      * panel. */
     DIR *dp = opendir(resolved);
     if (dp == NULL) {
+        /* Same reasoning as the realpath() case above - opendir() can
+         * fail for reasons other than a plain permission denial (e.g.
+         * ENOENT on a race, EMFILE if the process is out of file
+         * descriptors), so report the real one instead of always saying
+         * "Permission denied" regardless of the actual cause. */
+        int saved_errno = errno;
         if (error_msg != NULL) {
-            snprintf(error_msg, error_msg_size, "Permission denied for this directory");
+            snprintf(error_msg, error_msg_size, "Cannot open \"%s\": %s", resolved,
+                     strerror(saved_errno));
         }
         return 0;
     }
@@ -83,4 +119,18 @@ int builtin_cd(char *current_dir, const char *command, char *error_msg, size_t e
 
     snprintf(current_dir, PATH_MAX, "%s", resolved);
     return 1;
+}
+
+size_t utf8_prev_char_len(const char *buf, size_t len)
+{
+    if (len == 0) {
+        return 0;
+    }
+    size_t new_len = len - 1;
+    /* UTF-8 continuation bytes are 10xxxxxx (0x80-0xBF); skip back over
+     * any of those to reach the lead byte of the last codepoint. */
+    while (new_len > 0 && ((unsigned char)buf[new_len] & 0xC0) == 0x80) {
+        new_len--;
+    }
+    return len - new_len;
 }

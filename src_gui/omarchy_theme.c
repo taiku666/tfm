@@ -1,5 +1,6 @@
 #include "omarchy_theme.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,7 +38,15 @@ int omarchy_theme_load(OmarchyThemeColors *out)
     }
 
     char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/.local/state/omarchy/current/theme/colors.toml", home);
+    /* Checked explicitly: an unchecked snprintf() truncating a very long
+     * $HOME would silently build a shorter, unrelated path instead of
+     * failing outright - fopen() on that path would most likely just
+     * fail anyway (ENOENT), but "definitely refuse" is more honest than
+     * "probably happens to fail". */
+    if ((size_t)snprintf(path, sizeof(path), "%s/.local/state/omarchy/current/theme/colors.toml",
+                          home) >= sizeof(path)) {
+        return 0;
+    }
 
     FILE *fp = fopen(path, "r");
     if (fp == NULL) {
@@ -118,9 +127,16 @@ static int scan_rounding_in_file(const char *path, int *out_value)
         while (*after == ' ' || *after == '\t') {
             after++;
         }
-        int value;
-        if (sscanf(after, "%d", &value) == 1) {
-            *out_value = value;
+        /* strtol(), not sscanf("%d", ...): sscanf's %d on a pathological
+         * number of digits (this file is user-editable Hyprland Lua
+         * config) is undefined behavior on overflow, whereas strtol()
+         * defines the outcome (clamped to LONG_MIN/LONG_MAX, errno set)
+         * - clamped below to a sane corner-radius range regardless. */
+        errno = 0;
+        char *end = NULL;
+        long parsed = strtol(after, &end, 10);
+        if (end != after && errno == 0 && parsed >= 0 && parsed <= 1000) {
+            *out_value = (int)parsed;
             found = 1;
             break;
         }
@@ -136,8 +152,8 @@ int omarchy_hypr_corner_rounding(void)
     char path[PATH_MAX];
     int value = 0;
 
-    if (home != NULL) {
-        snprintf(path, sizeof(path), "%s/.config/hypr/looknfeel.lua", home);
+    if (home != NULL &&
+        (size_t)snprintf(path, sizeof(path), "%s/.config/hypr/looknfeel.lua", home) < sizeof(path)) {
         if (scan_rounding_in_file(path, &value)) {
             return value;
         }

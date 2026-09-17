@@ -34,7 +34,10 @@ void fileops_copy(const char *src, const char *dest_dir, const FileOpCallbacks *
  * path (same filesystem only); on failure due to different filesystems,
  * copies instead (reporting progress via cb) and then deletes the
  * original. If the destination already exists, asks like fileops_copy
- * (skip/overwrite/abort). */
+ * (skip/overwrite/abort) - note that choosing Overwrite when src and the
+ * existing destination are of different types (file vs. directory)
+ * recursively deletes the whole existing destination tree first, since
+ * rename()/a merge can't reconcile a type mismatch. */
 void fileops_move(const char *src, const char *dest_dir, const FileOpCallbacks *cb);
 
 /* Deletes path (file or directory, recursively). On errors (e.g. missing
