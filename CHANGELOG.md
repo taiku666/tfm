@@ -3,7 +3,7 @@
 Versioned via `TFM_VERSION` in `include/tfm_common.h` and git tags
 (`vX.Y.Z`); this file tracks notable changes per release.
 
-## Unreleased
+## 0.5.0
 
 - **Recoverable delete (trash/undo).** F8 now moves the selected item to
   the freedesktop.org home trash (`$XDG_DATA_HOME/Trash`, the same

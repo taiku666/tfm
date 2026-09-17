@@ -4,7 +4,7 @@
 #include <stddef.h>
 
 /* Shared across both frontends' --version output. */
-#define TFM_VERSION "0.4.0"
+#define TFM_VERSION "0.5.0"
 
 /* Some libc implementations (e.g. musl) don't define PATH_MAX in <limits.h>. */
 #ifndef PATH_MAX
