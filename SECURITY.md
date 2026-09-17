@@ -28,7 +28,8 @@ invoking user's files (a genuine privilege boundary violation).
 
 - The shell command bar in both front-ends runs the user's own typed
   command via `/bin/sh -c` - this is the file manager's intentional
-  command-bar feature, not injectable from any untrusted source. See
-  CODE_REVIEW.md for the full reasoning.
+  command-bar feature, not injectable from any untrusted source: no
+  data from a file, filename, or any other non-interactive source is
+  ever spliced into the command string.
 - `$EDITOR` is invoked with the user's own environment, as expected of
   any tool that shells out to the user's configured editor.
