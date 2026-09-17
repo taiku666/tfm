@@ -1,11 +1,35 @@
 # Changelog
 
-TFM does not yet do versioned releases (see `TFM_VERSION` in
-`include/tfm_common.h`, currently `0.1.0` for both binaries) - this file
-tracks notable changes by theme rather than by release tag until that
-changes.
+Versioned via `TFM_VERSION` in `include/tfm_common.h` and git tags
+(`vX.Y.Z`); this file tracks notable changes per release.
 
-## Unreleased
+## 0.4.0
+
+- Closed out nearly every remaining open Medium/Low finding from the
+  project's code review passes: UTF-8 backspace (byte-vs-codepoint),
+  a keystroke silently discarded when it arrived alongside a terminal
+  resize, `fileops_move()` not reporting a failed source-side delete,
+  NULL-pointer guards on shared helpers, a directory-recursion depth
+  limit (stack-overflow safety), a permission-widening window during
+  copy, `.ini` value escaping (a `\n` in a path no longer corrupts
+  `tfm.ini`), copy now preserves ownership/timestamps, `shell.c` child
+  hygiene (stopped children, EINTR busy-spin), lossy `cd` error
+  messages, GUI close-request dialog stacking, escape-sequence
+  handling (Home/End/PgUp/PgDn/Insert/Delete/Shift-Tab now recognized,
+  `select()`-based timeout disambiguation, unmatched bytes replayed
+  instead of dropped), locale-aware directory sorting (`setlocale()`
+  was never called), `colors.toml`/Hyprland-config parsing edge cases,
+  GUI panel selection now restored by name after a reload, and a
+  dynamically-sized rename/mkdir prompt buffer.
+- Investigated and disproved one long-standing "AdwDialog leaks a
+  GObject reference" finding with a real weak-reference trace instead
+  of leaving it unverified.
+- Every fix verified with a real test (pty harness, `/tmp` fault
+  injection, or a live Hyprland screenshot), not by inspection alone.
+- Removed dangling references to the project's local, gitignored
+  `CODE_REVIEW.md` from the public `CONTRIBUTING.md`/`SECURITY.md`.
+
+## 0.3.0
 
 - Two independent AI-assisted code review passes; all reported
   Critical/High-severity findings fixed and verified with real `/tmp`
@@ -21,6 +45,10 @@ changes.
 - `dir_color` made configurable (previously hardcoded to `"blue"`).
 - Makefile: header-dependency tracking (`-MMD -MP`), `DESTDIR` support,
   `test`/`lint`/`asan` targets, distro-neutral dependency-install messages.
+
+## 0.2.0 / 0.1.0
+
+See the GitHub releases for these versions - predate this file.
 
 ## Initial release
 
