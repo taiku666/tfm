@@ -107,6 +107,17 @@ make install-gui-theme-hook   # installs the Omarchy theme-change hook for tfm-g
 
 `PREFIX` can be overridden, e.g. `make install PREFIX=$HOME/.local`.
 
+### Prebuilt binaries
+
+Each [release](https://github.com/taiku666/tfm/releases) also attaches
+prebuilt `tfm`/`tfm-gui` binaries. They're built on one x86-64
+Arch/Omarchy machine and dynamically linked against its system
+glibc/GTK4/libadwaita — they're not statically linked or
+cross-compiled, so they aren't guaranteed to run on other distros or
+older library versions. Building from source (above) is the reliable
+path; the prebuilt binaries are a convenience, not a portable release
+artifact.
+
 ## Project structure
 
 ```
