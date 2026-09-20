@@ -599,6 +599,30 @@ int main(int argc, char *argv[])
             compute_layout(&layout);
             panel_move_selection(active_panel, 1, panel_visible_rows(&layout));
             redraw_ui(&cfg, &panel_left, &panel_right, focus, cmd_buffer);
+        } else if (key.type == KEY_HOME) {
+            Layout layout;
+            compute_layout(&layout);
+            /* -(int)count always reaches index 0; panel_move_selection()
+             * clamps, so overshooting is harmless. */
+            panel_move_selection(active_panel, -(int)active_panel->count, panel_visible_rows(&layout));
+            redraw_ui(&cfg, &panel_left, &panel_right, focus, cmd_buffer);
+        } else if (key.type == KEY_END) {
+            Layout layout;
+            compute_layout(&layout);
+            panel_move_selection(active_panel, (int)active_panel->count, panel_visible_rows(&layout));
+            redraw_ui(&cfg, &panel_left, &panel_right, focus, cmd_buffer);
+        } else if (key.type == KEY_PGUP) {
+            Layout layout;
+            compute_layout(&layout);
+            int visible_rows = panel_visible_rows(&layout);
+            panel_move_selection(active_panel, -visible_rows, visible_rows);
+            redraw_ui(&cfg, &panel_left, &panel_right, focus, cmd_buffer);
+        } else if (key.type == KEY_PGDN) {
+            Layout layout;
+            compute_layout(&layout);
+            int visible_rows = panel_visible_rows(&layout);
+            panel_move_selection(active_panel, visible_rows, visible_rows);
+            redraw_ui(&cfg, &panel_left, &panel_right, focus, cmd_buffer);
         } else if (key.type == KEY_CHAR && key.ch == '\t') {
             focus = (focus == FOCUS_LEFT) ? FOCUS_RIGHT : FOCUS_LEFT;
             redraw_ui(&cfg, &panel_left, &panel_right, focus, cmd_buffer);
