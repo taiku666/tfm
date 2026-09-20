@@ -222,7 +222,10 @@ static int copy_file(const char *src_path, const char *dest_path, CopyProgress *
     for (;;) {
         FILE *in = fopen(src_path, "rb");
         if (in == NULL) {
-            FileOpChoice choice = report_error(cb, "Error reading", src_path);
+            int saved_errno = errno;
+            char msg[PATH_MAX + 128];
+            snprintf(msg, sizeof(msg), "%s: %s", src_path, strerror(saved_errno));
+            FileOpChoice choice = report_error(cb, "Error reading", msg);
             if (choice == FILEOPS_CHOICE_RETRY) {
                 continue;
             }
@@ -251,6 +254,9 @@ static int copy_file(const char *src_path, const char *dest_path, CopyProgress *
         int dest_fd = open(dest_path, open_flags, 0600);
         FILE *out = (dest_fd != -1) ? fdopen(dest_fd, "wb") : NULL;
         if (out == NULL) {
+            /* Captured immediately after the failing open()/fdopen() -
+             * before close()/unlink()/fclose() below can clobber it. */
+            int saved_errno = errno;
             if (dest_fd != -1) {
                 /* open() succeeded but fdopen() failed - the file exists
                  * (freshly created or truncated) but is now an orphaned
@@ -261,7 +267,9 @@ static int copy_file(const char *src_path, const char *dest_path, CopyProgress *
                 dest_created = 0;
             }
             fclose(in);
-            FileOpChoice choice = report_error(cb, "Error writing", dest_path);
+            char msg[PATH_MAX + 128];
+            snprintf(msg, sizeof(msg), "%s: %s", dest_path, strerror(saved_errno));
+            FileOpChoice choice = report_error(cb, "Error writing", msg);
             if (choice == FILEOPS_CHOICE_RETRY) {
                 continue;
             }
@@ -279,10 +287,16 @@ static int copy_file(const char *src_path, const char *dest_path, CopyProgress *
         long long bytes_before_attempt = progress->copied_bytes;
 
         int failed = 0;
+        /* Captured at the point of the specific failure below (fwrite,
+         * ferror, or fclose further down) so the eventual error message
+         * names the real cause instead of always saying the same generic
+         * "Error writing" with no detail. */
+        int write_errno = 0;
         char buffer[65536];
         size_t n;
         while ((n = fread(buffer, 1, sizeof(buffer), in)) > 0) {
             if (fwrite(buffer, 1, n, out) != n) {
+                write_errno = errno;
                 failed = 1;
                 break;
             }
@@ -299,6 +313,7 @@ static int copy_file(const char *src_path, const char *dest_path, CopyProgress *
              * error (e.g. EIO on a flaky mount) - without this check a
              * mid-copy I/O error looks identical to a successful,
              * complete copy. */
+            write_errno = errno;
             failed = 1;
         }
 
@@ -350,16 +365,25 @@ static int copy_file(const char *src_path, const char *dest_path, CopyProgress *
         }
 
         int in_close_failed = fclose(in) != 0;
+        int in_close_errno = errno;
         int out_close_failed = fclose(out) != 0;
-        if (in_close_failed || out_close_failed) {
+        int out_close_errno = errno;
+        if (!failed && (in_close_failed || out_close_failed)) {
             /* A buffered write error (e.g. ENOSPC) can surface only at
-             * fclose(), after every fwrite() appeared to succeed. */
+             * fclose(), after every fwrite() appeared to succeed. Prefer
+             * the write side's errno since that's the fclose whose
+             * failure actually corrupted the copy; the read side closing
+             * badly is comparatively harmless (the data was already
+             * fully read). */
+            write_errno = out_close_failed ? out_close_errno : in_close_errno;
             failed = 1;
         }
 
         if (failed) {
             progress->copied_bytes = bytes_before_attempt;
-            FileOpChoice choice = report_error(cb, "Error writing", dest_path);
+            char msg[PATH_MAX + 128];
+            snprintf(msg, sizeof(msg), "%s: %s", dest_path, strerror(write_errno));
+            FileOpChoice choice = report_error(cb, "Error writing", msg);
             if (choice == FILEOPS_CHOICE_RETRY) {
                 continue;
             }
@@ -393,6 +417,7 @@ static int remove_existing_for_overwrite(const char *dest, const struct stat *de
         if (unlink(dest) == 0) {
             return 1;
         }
+        int saved_errno = errno;
         /* An ignored unlink() failure (e.g. EPERM on an immutable file)
          * used to fall through silently: the caller's subsequent
          * O_EXCL/mkdir create would then fail EEXIST against the entry
@@ -402,7 +427,9 @@ static int remove_existing_for_overwrite(const char *dest, const struct stat *de
          * meaning at this layer (the caller already committed to
          * overwriting), so it's treated the same as Abort: stop this
          * entry rather than silently proceeding as if it were removed. */
-        FileOpChoice choice = report_error(cb, "Cannot remove", dest);
+        char msg[PATH_MAX + 128];
+        snprintf(msg, sizeof(msg), "%s: %s", dest, strerror(saved_errno));
+        FileOpChoice choice = report_error(cb, "Cannot remove", msg);
         if (choice == FILEOPS_CHOICE_RETRY) {
             continue;
         }
@@ -439,7 +466,10 @@ static int copy_recursive_impl(const char *src, const char *dest, CopyProgress *
         if (lstat(src, &st) == 0) {
             break;
         }
-        FileOpChoice choice = report_error(cb, "Error", src);
+        int saved_errno = errno;
+        char msg[PATH_MAX + 128];
+        snprintf(msg, sizeof(msg), "%s: %s", src, strerror(saved_errno));
+        FileOpChoice choice = report_error(cb, "Error", msg);
         if (choice == FILEOPS_CHOICE_RETRY) {
             continue;
         }
@@ -456,7 +486,10 @@ static int copy_recursive_impl(const char *src, const char *dest, CopyProgress *
         for (;;) {
             len = readlink(src, target, sizeof(target) - 1);
             if (len < 0) {
-                FileOpChoice choice = report_error(cb, "Error reading link", src);
+                int saved_errno = errno;
+                char msg[PATH_MAX + 128];
+                snprintf(msg, sizeof(msg), "%s: %s", src, strerror(saved_errno));
+                FileOpChoice choice = report_error(cb, "Error reading link", msg);
                 if (choice == FILEOPS_CHOICE_RETRY) {
                     continue;
                 }
@@ -508,7 +541,10 @@ static int copy_recursive_impl(const char *src, const char *dest, CopyProgress *
             if (symlink(target, dest) == 0) {
                 return 1;
             }
-            FileOpChoice choice = report_error(cb, "Error creating link", dest);
+            int saved_errno = errno;
+            char msg[PATH_MAX + 128];
+            snprintf(msg, sizeof(msg), "%s: %s", dest, strerror(saved_errno));
+            FileOpChoice choice = report_error(cb, "Error creating link", msg);
             if (choice == FILEOPS_CHOICE_RETRY) {
                 continue;
             }
@@ -555,7 +591,8 @@ static int copy_recursive_impl(const char *src, const char *dest, CopyProgress *
             chown(dest, st.st_uid, st.st_gid);
             break;
         }
-        if (errno == EEXIST) {
+        int mkdir_errno = errno;
+        if (mkdir_errno == EEXIST) {
             struct stat dest_existing;
             if (lstat(dest, &dest_existing) != 0) {
                 /* dest vanished between the failed mkdir() and this lstat()
@@ -586,7 +623,10 @@ static int copy_recursive_impl(const char *src, const char *dest, CopyProgress *
                  * OVERWRITE and still can't actually be removed -
                  * looping the same prompt instead of surfacing the real
                  * cause. */
-                FileOpChoice remove_choice = report_error(cb, "Cannot remove", dest);
+                int unlink_errno = errno;
+                char unlink_msg[PATH_MAX + 128];
+                snprintf(unlink_msg, sizeof(unlink_msg), "%s: %s", dest, strerror(unlink_errno));
+                FileOpChoice remove_choice = report_error(cb, "Cannot remove", unlink_msg);
                 if (remove_choice == FILEOPS_CHOICE_RETRY) {
                     continue;
                 }
@@ -598,7 +638,9 @@ static int copy_recursive_impl(const char *src, const char *dest, CopyProgress *
             }
             continue;
         }
-        FileOpChoice choice = report_error(cb, "Cannot create directory", dest);
+        char mkdir_msg[PATH_MAX + 128];
+        snprintf(mkdir_msg, sizeof(mkdir_msg), "%s: %s", dest, strerror(mkdir_errno));
+        FileOpChoice choice = report_error(cb, "Cannot create directory", mkdir_msg);
         if (choice == FILEOPS_CHOICE_RETRY) {
             continue;
         }
@@ -615,7 +657,10 @@ static int copy_recursive_impl(const char *src, const char *dest, CopyProgress *
         if (dp != NULL) {
             break;
         }
-        FileOpChoice choice = report_error(cb, "Error reading", src);
+        int saved_errno = errno;
+        char msg[PATH_MAX + 128];
+        snprintf(msg, sizeof(msg), "%s: %s", src, strerror(saved_errno));
+        FileOpChoice choice = report_error(cb, "Error reading", msg);
         if (choice == FILEOPS_CHOICE_RETRY) {
             continue;
         }
@@ -661,12 +706,15 @@ static int copy_recursive_impl(const char *src, const char *dest, CopyProgress *
         if (errno == 0) {
             break;
         }
+        int saved_errno = errno;
+        char msg[PATH_MAX + 128];
+        snprintf(msg, sizeof(msg), "%s: %s", src, strerror(saved_errno));
         /* readdir() returning NULL means EOF or error alike - without
          * this check, a mid-read failure (EIO on a flaky mount) silently
          * looks like "done copying this directory", leaving entries
          * added to the source after the failure point uncopied with no
          * indication anything went wrong. */
-        FileOpChoice choice = report_error(cb, "Error reading", src);
+        FileOpChoice choice = report_error(cb, "Error reading", msg);
         if (choice == FILEOPS_CHOICE_RETRY) {
             continue;
         }
@@ -835,7 +883,8 @@ static int delete_recursive_impl(const char *path, const FileOpCallbacks *cb, in
         if (lstat(path, &st) == 0) {
             break;
         }
-        if (errno == ENOENT) {
+        int saved_errno = errno;
+        if (saved_errno == ENOENT) {
             /* Already gone (e.g. removed by another process between the
              * caller listing it and this call) - the goal of "path no
              * longer exists" is already met, so treat this as success
@@ -843,7 +892,9 @@ static int delete_recursive_impl(const char *path, const FileOpCallbacks *cb, in
              * never come back. */
             return 1;
         }
-        FileOpChoice choice = report_error(cb, "Error", path);
+        char msg[PATH_MAX + 128];
+        snprintf(msg, sizeof(msg), "%s: %s", path, strerror(saved_errno));
+        FileOpChoice choice = report_error(cb, "Error", msg);
         if (choice == FILEOPS_CHOICE_RETRY) {
             continue;
         }
@@ -857,7 +908,10 @@ static int delete_recursive_impl(const char *path, const FileOpCallbacks *cb, in
             if (dp != NULL) {
                 break;
             }
-            FileOpChoice choice = report_error(cb, "Cannot access directory", path);
+            int saved_errno = errno;
+            char msg[PATH_MAX + 128];
+            snprintf(msg, sizeof(msg), "%s: %s", path, strerror(saved_errno));
+            FileOpChoice choice = report_error(cb, "Cannot access directory", msg);
             if (choice == FILEOPS_CHOICE_RETRY) {
                 continue;
             }
@@ -891,12 +945,15 @@ static int delete_recursive_impl(const char *path, const FileOpCallbacks *cb, in
             if (errno == 0) {
                 break;
             }
+            int saved_errno = errno;
+            char msg[PATH_MAX + 128];
+            snprintf(msg, sizeof(msg), "%s: %s", path, strerror(saved_errno));
             /* Without this check, a mid-read readdir() failure (EIO on a
              * flaky mount) silently looks like "directory fully
              * enumerated", leaving unprocessed entries behind - the
              * subsequent rmdir() below would then just fail ENOTEMPTY
              * with no indication why. */
-            FileOpChoice choice = report_error(cb, "Error reading", path);
+            FileOpChoice choice = report_error(cb, "Error reading", msg);
             if (choice == FILEOPS_CHOICE_RETRY) {
                 continue;
             }
@@ -912,11 +969,14 @@ static int delete_recursive_impl(const char *path, const FileOpCallbacks *cb, in
             if (rmdir(path) == 0) {
                 return 1;
             }
-            if (errno == ENOENT) {
+            int rmdir_errno = errno;
+            if (rmdir_errno == ENOENT) {
                 /* Same race as above: already gone is success. */
                 return 1;
             }
-            FileOpChoice choice = report_error(cb, "Cannot remove directory", path);
+            char msg[PATH_MAX + 128];
+            snprintf(msg, sizeof(msg), "%s: %s", path, strerror(rmdir_errno));
+            FileOpChoice choice = report_error(cb, "Cannot remove directory", msg);
             if (choice == FILEOPS_CHOICE_RETRY) {
                 continue;
             }
@@ -928,11 +988,14 @@ static int delete_recursive_impl(const char *path, const FileOpCallbacks *cb, in
         if (unlink(path) == 0) {
             return 1;
         }
-        if (errno == ENOENT) {
+        int unlink_errno = errno;
+        if (unlink_errno == ENOENT) {
             /* Same race as the lstat() above: already gone is success. */
             return 1;
         }
-        FileOpChoice choice = report_error(cb, "Cannot delete file", path);
+        char msg[PATH_MAX + 128];
+        snprintf(msg, sizeof(msg), "%s: %s", path, strerror(unlink_errno));
+        FileOpChoice choice = report_error(cb, "Cannot delete file", msg);
         if (choice == FILEOPS_CHOICE_RETRY) {
             continue;
         }
