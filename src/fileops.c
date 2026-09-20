@@ -1,4 +1,7 @@
-#define _DEFAULT_SOURCE
+/* _GNU_SOURCE (a superset of _DEFAULT_SOURCE) for renameat2()/
+ * RENAME_NOREPLACE, used by move_to_exact_dest() below to close a TOCTOU
+ * race in the trash implementation's rename() fast path. */
+#define _GNU_SOURCE
 
 #include "fileops.h"
 
@@ -1178,8 +1181,34 @@ void fileops_move(const char *src, const char *dest_dir, const FileOpCallbacks *
  * 1 on success, 0 if aborted/failed (reported via cb). */
 static int move_to_exact_dest(const char *src, const char *dest, const FileOpCallbacks *cb)
 {
-    if (rename(src, dest) == 0) {
+    /* renameat2(..., RENAME_NOREPLACE) instead of a plain rename(): a bare
+     * rename() atomically REPLACES dest if it already exists, with no way
+     * to ask it not to - both callers of this function rely on dest being
+     * a just-verified-free name/path (fileops_trash()'s
+     * unique_trash_name(), fileops_restore_last_trashed()'s lstat()
+     * check), but a plain rename() re-opens a TOCTOU window between that
+     * check and the actual rename (e.g. two trash operations racing on
+     * the same source basename, or a file created at the restore target
+     * in that narrow window) that would otherwise silently destroy
+     * whatever was already at dest. RENAME_NOREPLACE makes the kernel
+     * enforce "only if dest doesn't exist" atomically, closing the race
+     * outright instead of just narrowing it. */
+    int renamed = renameat2(AT_FDCWD, src, AT_FDCWD, dest, RENAME_NOREPLACE) == 0;
+    if (!renamed && (errno == EINVAL || errno == ENOSYS)) {
+        /* RENAME_NOREPLACE isn't supported by every kernel/filesystem
+         * (needs Linux >=3.15, and some FUSE/network filesystems still
+         * don't implement it) - fall back to a plain rename() rather than
+         * refusing the move outright on an otherwise-working system. This
+         * reopens the race above, but only on filesystems where the
+         * atomic check was never available to begin with. */
+        renamed = rename(src, dest) == 0;
+    }
+    if (renamed) {
         return 1;
+    }
+    if (errno == EEXIST) {
+        report_error(cb, "Error moving", "Something already exists at the destination");
+        return 0;
     }
     if (errno != EXDEV) {
         report_error(cb, "Error moving", strerror(errno));
@@ -1263,27 +1292,35 @@ static int get_trash_dirs(char *files_dir, size_t files_size, char *info_dir, si
     return mkdir_parents(files_dir, 0700) && mkdir_parents(info_dir, 0700);
 }
 
-/* Finds a name for basename inside files_dir that doesn't already exist
- * (checked with lstat, so a leftover dangling symlink still counts as
- * "taken"), appending " (1)", " (2)", ... on collision. Writes the
- * chosen name (not a full path) into out_name. The same name (with the
- * same suffix, if any) is used for both files/<name> and
- * info/<name>.trashinfo - fileops_restore_last_trashed() relies on that
- * exact pairing to find the trashed item that matches a given metadata
- * file. */
-static int unique_trash_name(const char *files_dir, const char *basename, char *out_name,
-                              size_t out_name_size)
+/* Finds a name for basename that doesn't already exist as either
+ * files_dir/<name> or info_dir/<name>.trashinfo (checked with lstat, so a
+ * leftover dangling symlink still counts as "taken"), appending " (1)",
+ * " (2)", ... on collision. Writes the chosen name (not a full path) into
+ * out_name. The same name (with the same suffix, if any) is used for both
+ * files/<name> and info/<name>.trashinfo - fileops_restore_last_trashed()
+ * relies on that exact pairing to find the trashed item that matches a
+ * given metadata file. Both directories are checked (not just files_dir):
+ * an orphaned .trashinfo file (e.g. left behind by a process killed
+ * between fileops_restore_last_trashed()'s move-back and its cleanup
+ * remove() of the old metadata) would otherwise pass a files_dir-only
+ * check and then get silently overwritten by fopen(info_path, "w") when
+ * a later, unrelated trash operation happens to generate the same name. */
+static int unique_trash_name(const char *files_dir, const char *info_dir, const char *basename,
+                              char *out_name, size_t out_name_size)
 {
     if ((size_t)snprintf(out_name, out_name_size, "%s", basename) >= out_name_size) {
         return 0;
     }
     for (int suffix = 1; suffix < 100000; suffix++) {
         char candidate_path[PATH_MAX];
-        if (!path_join(candidate_path, sizeof(candidate_path), files_dir, out_name)) {
+        char candidate_info_path[PATH_MAX];
+        struct stat st;
+        if (!path_join(candidate_path, sizeof(candidate_path), files_dir, out_name) ||
+            (size_t)snprintf(candidate_info_path, sizeof(candidate_info_path), "%s/%s.trashinfo",
+                              info_dir, out_name) >= sizeof(candidate_info_path)) {
             return 0;
         }
-        struct stat st;
-        if (lstat(candidate_path, &st) != 0) {
+        if (lstat(candidate_path, &st) != 0 && lstat(candidate_info_path, &st) != 0) {
             return 1;
         }
         if ((size_t)snprintf(out_name, out_name_size, "%s (%d)", basename, suffix) >= out_name_size) {
@@ -1388,7 +1425,7 @@ void fileops_trash(const char *path, const FileOpCallbacks *cb)
     }
 
     char trash_name[PATH_MAX];
-    if (!unique_trash_name(files_dir, base, trash_name, sizeof(trash_name))) {
+    if (!unique_trash_name(files_dir, info_dir, base, trash_name, sizeof(trash_name))) {
         report_error(cb, "Error", "Could not find a free name in the trash");
         return;
     }
@@ -1448,8 +1485,14 @@ int fileops_restore_last_trashed(const FileOpCallbacks *cb, char *restored_path_
     char newest_name[PATH_MAX] = "";
     time_t newest_mtime = 0;
     struct dirent *entry;
-    errno = 0;
-    while ((entry = readdir(dp)) != NULL) {
+    /* errno reset right before every readdir() call, not just once before
+     * the loop - matching copy_recursive_impl()/delete_recursive_impl()'s
+     * pattern (see their own comments): without this, readdir() returning
+     * NULL for a mid-scan error (e.g. EIO on a flaky mount) looks
+     * identical to a normal, complete "directory fully enumerated" EOF,
+     * silently reporting "trash is empty" even when a real trashed item
+     * exists and simply wasn't seen. */
+    while ((errno = 0, entry = readdir(dp)) != NULL) {
         size_t name_len = strlen(entry->d_name);
         size_t suffix_len = sizeof(trashinfo_suffix) - 1;
         if (name_len <= suffix_len ||
@@ -1468,6 +1511,11 @@ int fileops_restore_last_trashed(const FileOpCallbacks *cb, char *restored_path_
             newest_mtime = st.st_mtime;
             snprintf(newest_name, sizeof(newest_name), "%s", entry->d_name);
         }
+    }
+    if (errno != 0) {
+        report_error(cb, "Error reading trash", strerror(errno));
+        closedir(dp);
+        return 0;
     }
     closedir(dp);
 

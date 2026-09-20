@@ -25,7 +25,12 @@ static int config_get_dir(char *buf, size_t len)
 {
     const char *home = getenv("HOME");
     if (home == NULL) {
-        home = ".";
+        /* Matches config_set_defaults()'s own $HOME-unset fallback ("/")
+         * - using "." (the cwd) here instead would make the config
+         * file's location silently cwd-dependent: launching tfm from two
+         * different directories would read/write two unrelated
+         * "./.tfm/tfm.ini" files with no diagnostic either way. */
+        home = "/";
     }
     int n = snprintf(buf, len, "%s/%s", home, CONFIG_DIR_NAME);
     return n > 0 && (size_t)n < len;

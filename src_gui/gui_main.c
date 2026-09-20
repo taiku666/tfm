@@ -1088,7 +1088,16 @@ static void action_move(void)
                 char new_path[PATH_MAX];
                 struct stat existing_st;
                 int confirmed = 1;
-                if (!path_join(old_path, sizeof(old_path), active->path, item->name) ||
+                if (!is_safe_path_component(new_name)) {
+                    /* Without this, a typed name containing '/' (e.g.
+                     * "../../important") silently renames the file
+                     * OUTSIDE the current directory via the bare
+                     * rename() below, with none of fileops_move()'s
+                     * safety checks - "Rename" should never leave the
+                     * current directory. */
+                    show_error_dialog("Error", "Name cannot contain '/' or be '.'/'..'");
+                    confirmed = 0;
+                } else if (!path_join(old_path, sizeof(old_path), active->path, item->name) ||
                     !path_join(new_path, sizeof(new_path), active->path, new_name)) {
                     show_error_dialog("Error", "Path too long");
                     confirmed = 0;
@@ -1139,7 +1148,13 @@ static void action_mkdir(void)
     }
     if (name[0] != '\0') {
         char new_dir_path[PATH_MAX];
-        if (!path_join(new_dir_path, sizeof(new_dir_path), active->path, name)) {
+        if (!is_safe_path_component(name)) {
+            /* Without this, a name like "existingsub/newname" silently
+             * creates the directory INSIDE an existing subdirectory
+             * instead of in the current directory, as "New folder"
+             * implies. */
+            show_error_dialog("Error", "Name cannot contain '/' or be '.'/'..'");
+        } else if (!path_join(new_dir_path, sizeof(new_dir_path), active->path, name)) {
             show_error_dialog("Error", "Path too long");
         } else if (mkdir(new_dir_path, 0755) != 0) {
             show_error_dialog("Error", strerror(errno));
@@ -1354,8 +1369,13 @@ static int is_foot_the_active_terminal(void)
     if (config_home != NULL && config_home[0] != '\0') {
         dirs[ndirs++] = config_home;
     } else if (home != NULL) {
-        snprintf(dir_buf, sizeof(dir_buf), "%s/.config", home);
-        dirs[ndirs++] = dir_buf;
+        /* Checked explicitly (matching omarchy_theme.c's CR4-M21 fix,
+         * missed here when that one was applied): an unchecked
+         * snprintf() truncating a very long $HOME would silently search
+         * a shorter, unrelated directory instead of failing outright. */
+        if ((size_t)snprintf(dir_buf, sizeof(dir_buf), "%s/.config", home) < sizeof(dir_buf)) {
+            dirs[ndirs++] = dir_buf;
+        }
     }
     /* Only the first $XDG_CONFIG_DIRS entry is checked here (matching this
      * function's scope: "is foot active", not a full multi-dir search) -
@@ -1368,15 +1388,22 @@ static int is_foot_the_active_terminal(void)
 
     for (int i = 0; i < ndirs; i++) {
         char path[PATH_MAX];
-        snprintf(path, sizeof(path), "%s/xdg-terminal-exec/xdg-terminals.list", dirs[i]);
-        int r = xdg_terminals_list_picks_foot(path);
-        if (r >= 0) {
-            return r;
+        /* Both snprintf() calls' truncation checked - a truncated path
+         * would almost certainly just fail its fopen() anyway (ENOENT),
+         * but skipping it outright is more honest than silently
+         * searching a shortened, unrelated path. */
+        if ((size_t)snprintf(path, sizeof(path), "%s/xdg-terminal-exec/xdg-terminals.list",
+                              dirs[i]) < sizeof(path)) {
+            int r = xdg_terminals_list_picks_foot(path);
+            if (r >= 0) {
+                return r;
+            }
         }
-        snprintf(path, sizeof(path), "%s/xdg-terminals.list", dirs[i]);
-        r = xdg_terminals_list_picks_foot(path);
-        if (r >= 0) {
-            return r;
+        if ((size_t)snprintf(path, sizeof(path), "%s/xdg-terminals.list", dirs[i]) < sizeof(path)) {
+            int r = xdg_terminals_list_picks_foot(path);
+            if (r >= 0) {
+                return r;
+            }
         }
     }
 
@@ -1404,7 +1431,9 @@ static double read_terminal_font_size(void)
         return GUI_DEFAULT_FONT_SIZE;
     }
     char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/.config/foot/foot.ini", home);
+    if ((size_t)snprintf(path, sizeof(path), "%s/.config/foot/foot.ini", home) >= sizeof(path)) {
+        return GUI_DEFAULT_FONT_SIZE;
+    }
 
     FILE *fp = fopen(path, "r");
     if (fp == NULL) {

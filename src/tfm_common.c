@@ -22,6 +22,17 @@ int path_join(char *out, size_t out_size, const char *dir, const char *name)
     return n > 0 && (size_t)n < out_size;
 }
 
+int is_safe_path_component(const char *name)
+{
+    if (name == NULL || name[0] == '\0') {
+        return 0;
+    }
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+        return 0;
+    }
+    return strchr(name, '/') == NULL;
+}
+
 int builtin_cd(char *current_dir, const char *command, char *error_msg, size_t error_msg_size)
 {
     /* Public shared helper - don't rely on callers pre-checking, since a
@@ -127,10 +138,30 @@ size_t utf8_prev_char_len(const char *buf, size_t len)
         return 0;
     }
     size_t new_len = len - 1;
+    size_t continuation_bytes = 0;
     /* UTF-8 continuation bytes are 10xxxxxx (0x80-0xBF); skip back over
-     * any of those to reach the lead byte of the last codepoint. */
-    while (new_len > 0 && ((unsigned char)buf[new_len] & 0xC0) == 0x80) {
+     * any of those to reach the lead byte of the last codepoint. Capped
+     * at 3 continuation bytes (a well-formed codepoint is at most 4 bytes
+     * total) - without this cap, a buffer containing malformed UTF-8 (a
+     * long run of orphaned continuation bytes with no valid lead byte
+     * before them - not reachable via normal typing, only via a broken
+     * terminal/IME or already-corrupt input) would walk all the way back
+     * to index 0, and a single Backspace would delete the ENTIRE buffer
+     * instead of one character. */
+    while (new_len > 0 && continuation_bytes < 3 && ((unsigned char)buf[new_len] & 0xC0) == 0x80) {
         new_len--;
+        continuation_bytes++;
+    }
+    /* Also verify the byte actually landed on is a valid UTF-8 lead byte
+     * (0xxxxxxx, 110xxxxx, 1110xxxx, or 11110xxx) - malformed input could
+     * still stop mid-sequence within the capped walk above. If not,
+     * there's no well-formed codepoint to remove here at all; fall back
+     * to deleting exactly the last byte rather than guessing further. */
+    unsigned char lead = (unsigned char)buf[new_len];
+    int is_valid_lead = (lead & 0x80) == 0x00 || (lead & 0xE0) == 0xC0 || (lead & 0xF0) == 0xE0 ||
+                         (lead & 0xF8) == 0xF0;
+    if (!is_valid_lead) {
+        return 1;
     }
     return len - new_len;
 }

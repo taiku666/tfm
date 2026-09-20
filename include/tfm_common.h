@@ -15,6 +15,17 @@
  * in out (size out_size), 0 if truncated or if out/dir/name is NULL. */
 int path_join(char *out, size_t out_size, const char *dir, const char *name);
 
+/* Checks that name is safe to use as a single path COMPONENT (a new
+ * file/directory name typed into a Rename or New-Folder prompt) rather
+ * than a path - rejects NULL, "", ".", "..", and anything containing a
+ * '/'. Without this, a typed name like "../../etc/passwd" or
+ * "existingsub/newname" silently escapes the current directory when fed
+ * through path_join() + rename()/mkdir(), which do no such validation
+ * themselves (they're general-purpose path builders, used plenty of
+ * places where a full path is exactly what's wanted). Returns 1 if safe,
+ * 0 otherwise. */
+int is_safe_path_component(const char *name);
+
 /* Resolves a "cd [path]" command against current_dir (buffer of at least
  * PATH_MAX bytes), validating with realpath()+stat()+opendir(). Returns 1
  * and updates current_dir on success; returns 0 and writes a reason into

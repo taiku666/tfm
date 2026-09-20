@@ -74,7 +74,16 @@ void input_enable_raw_mode(void)
         winch_action.sa_handler = handle_sigwinch;
         sigemptyset(&winch_action.sa_mask);
         winch_action.sa_flags = 0; /* no SA_RESTART: read() must be interrupted */
-        sigaction(SIGWINCH, &winch_action, NULL);
+        /* Return value deliberately not surfaced to the user here (unlike
+         * main.c's terminating-signal handlers): this runs after
+         * screen_enter_alt_screen(), so an stderr write would land as
+         * stray text in the alt-screen buffer, corrupting the display -
+         * worse than the failure itself, which essentially cannot happen
+         * for a fixed, valid signal number on Linux anyway. On the
+         * astronomically unlikely failure, resize events are simply never
+         * handled (the panel layout stays at its size at startup) - a
+         * silent degradation, but a survivable one. */
+        (void)sigaction(SIGWINCH, &winch_action, NULL);
     }
 }
 

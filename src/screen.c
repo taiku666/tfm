@@ -625,7 +625,13 @@ void screen_draw_progress_popup(const char *title, const char *item, double perc
         inner_width = max_inner_width;
     }
 
-    char item_display[256];
+    /* PATH_MAX, not a smaller fixed size - item can be a full path up to
+     * PATH_MAX bytes; a smaller buffer would silently truncate it here,
+     * before the visual-width clipping below even runs (which correctly
+     * adds a "..." indicator, but only for its OWN clipping - a
+     * truncation at this snprintf() would have already lost bytes with
+     * no indicator at all). */
+    char item_display[PATH_MAX + 4];
     snprintf(item_display, sizeof(item_display), "%s", item);
     if (utf8_visual_width(item_display) > inner_width && inner_width > 3) {
         /* Keep as many trailing visible columns as needed, snapping to the
@@ -641,7 +647,7 @@ void screen_draw_progress_popup(const char *title, const char *item, double perc
             }
             col++;
         }
-        char truncated[256];
+        char truncated[PATH_MAX + 4];
         snprintf(truncated, sizeof(truncated), "...%s", item_display + cut);
         snprintf(item_display, sizeof(item_display), "%s", truncated);
     }

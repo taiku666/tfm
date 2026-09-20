@@ -235,19 +235,32 @@ static void install_terminating_signal_handlers(void)
     action.sa_handler = handle_terminating_signal;
     sigemptyset(&action.sa_mask);
     action.sa_flags = 0;
-    sigaction(SIGTERM, &action, NULL);
-    sigaction(SIGHUP, &action, NULL);
-    sigaction(SIGQUIT, &action, NULL);
+    /* Return values checked (unlike before) and reported to stderr - safe
+     * to do here specifically because this runs before
+     * screen_enter_alt_screen()/input_enable_raw_mode() below, so stderr
+     * is still the normal, visible terminal output. These essentially
+     * cannot fail for fixed, valid signal numbers on Linux, but silently
+     * ignoring a failure here would mean a degraded graceful-shutdown
+     * path (g_shutdown_requested, config_save() on exit) with zero
+     * indication to the user that it happened. */
+    if (sigaction(SIGTERM, &action, NULL) != 0 || sigaction(SIGHUP, &action, NULL) != 0 ||
+        sigaction(SIGQUIT, &action, NULL) != 0) {
+        fprintf(stderr, "tfm: warning: failed to install a signal handler: %s\n", strerror(errno));
+    }
     /* SIGINT: with ISIG cleared in raw mode (input.c), Ctrl-C arrives as
      * ordinary KEY_CHAR data, not this signal - but `kill -INT <pid>`
      * from outside the terminal still sends a real SIGINT, which
      * previously bypassed all cleanup (stuck raw mode/alt-screen/hidden
      * cursor). */
-    sigaction(SIGINT, &action, NULL);
+    if (sigaction(SIGINT, &action, NULL) != 0) {
+        fprintf(stderr, "tfm: warning: failed to install SIGINT handler: %s\n", strerror(errno));
+    }
     /* SIGPIPE: default action is to kill the process; writing to a
      * closed pipe (e.g. stdout piped into a reader that exits early)
      * would otherwise terminate tfm with no cleanup at all. */
-    signal(SIGPIPE, SIG_IGN);
+    if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+        fprintf(stderr, "tfm: warning: failed to ignore SIGPIPE: %s\n", strerror(errno));
+    }
 }
 
 int main(int argc, char *argv[])
@@ -287,7 +300,12 @@ int main(int argc, char *argv[])
     splash_show("TFM", "Taiku File Manager");
 
     Config cfg;
-    char config_load_error[TUI_MSG_BUFFER_SIZE] = "";
+    /* PATH_MAX + 128, not TUI_MSG_BUFFER_SIZE (300) - config.c's error
+     * messages are "Cannot open \"%s\": %s" with a path that can
+     * legitimately be up to PATH_MAX bytes; TUI_MSG_BUFFER_SIZE is sized
+     * for short, bounded messages elsewhere in this file and would
+     * silently truncate off the strerror() reason on a long $HOME. */
+    char config_load_error[PATH_MAX + 128] = "";
     config_load(&cfg, config_load_error, sizeof(config_load_error));
 
     screen_set_fancy_style(strcasecmp(cfg.icons, "omarchy") == 0);
@@ -463,7 +481,17 @@ int main(int argc, char *argv[])
                             char new_path[PATH_MAX];
                             struct stat existing_st;
                             int confirmed = 1;
-                            if (!path_join(old_path, sizeof(old_path), active_panel->path, entry->name) ||
+                            if (!is_safe_path_component(new_name)) {
+                                /* Without this, a typed name containing
+                                 * '/' (e.g. "../../important") silently
+                                 * renames the file OUTSIDE the current
+                                 * directory via a bare rename() below,
+                                 * with none of fileops_move()'s safety
+                                 * checks - "Rename" should never leave
+                                 * the current directory. */
+                                tui_show_popup("Error", "Name cannot contain '/' or be '.'/'..'");
+                                confirmed = 0;
+                            } else if (!path_join(old_path, sizeof(old_path), active_panel->path, entry->name) ||
                                 !path_join(new_path, sizeof(new_path), active_panel->path, new_name)) {
                                 tui_show_popup("Error", "Path too long");
                                 confirmed = 0;
@@ -515,7 +543,13 @@ int main(int argc, char *argv[])
             if (screen_prompt_text("New folder", new_dir_name, sizeof(new_dir_name)) &&
                 new_dir_name[0] != '\0') {
                 char new_dir_path[PATH_MAX];
-                if (!path_join(new_dir_path, sizeof(new_dir_path), active_panel->path, new_dir_name)) {
+                if (!is_safe_path_component(new_dir_name)) {
+                    /* Without this, a name like "existingsub/newname"
+                     * silently creates the directory INSIDE an existing
+                     * subdirectory instead of in the current directory,
+                     * as "New folder" implies. */
+                    tui_show_popup("Error", "Name cannot contain '/' or be '.'/'..'");
+                } else if (!path_join(new_dir_path, sizeof(new_dir_path), active_panel->path, new_dir_name)) {
                     tui_show_popup("Error", "Path too long");
                 } else if (mkdir(new_dir_path, 0755) != 0) {
                     tui_show_popup("Error", strerror(errno));
@@ -764,7 +798,7 @@ int main(int argc, char *argv[])
      * comment above) and raw mode is off, so there's no TUI left to show
      * a popup in - report a save failure to stderr instead, visible in
      * the shell tfm returns control to. */
-    char config_save_error[TUI_MSG_BUFFER_SIZE] = "";
+    char config_save_error[PATH_MAX + 128] = ""; /* see config_load_error's comment above */
     config_save(&cfg, config_save_error, sizeof(config_save_error));
     if (config_save_error[0] != '\0') {
         fprintf(stderr, "tfm: failed to save config: %s\n", config_save_error);
