@@ -27,11 +27,20 @@ typedef struct {
  * falling back to "/" if $HOME is unset). */
 void config_set_defaults(Config *cfg);
 
-/* Loads config from ~/.tfm/tfm.ini, or defaults if the file doesn't exist. */
-void config_load(Config *cfg);
+/* Loads config from ~/.tfm/tfm.ini, or defaults if the file doesn't exist.
+ * error_msg/error_msg_size are optional (pass NULL/0 to ignore) - on
+ * return, error_msg[0] is '\0' if the file was missing (the normal
+ * first-run case, silently using defaults) or loaded successfully, or a
+ * human-readable reason (naming the real syscall failure, e.g.
+ * "Cannot open ...: Permission denied") if an existing file could not be
+ * read. */
+void config_load(Config *cfg, char *error_msg, size_t error_msg_size);
 
-/* Saves config to ~/.tfm/tfm.ini, creating ~/.tfm if needed. */
-void config_save(const Config *cfg);
+/* Saves config to ~/.tfm/tfm.ini, creating ~/.tfm if needed. error_msg/
+ * error_msg_size are optional (pass NULL/0 to ignore) - on return,
+ * error_msg[0] is '\0' on success or a human-readable reason for the
+ * failure (naming the real syscall failure) otherwise. */
+void config_save(const Config *cfg, char *error_msg, size_t error_msg_size);
 
 /* Checks whether filename's extension (case-insensitive) is in
  * cfg->editor_extensions. Returns 1 on match, 0 otherwise (including a

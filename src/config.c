@@ -140,17 +140,34 @@ static char *trim(char *s)
     return s;
 }
 
-void config_load(Config *cfg)
+void config_load(Config *cfg, char *error_msg, size_t error_msg_size)
 {
     config_set_defaults(cfg);
 
+    if (error_msg != NULL && error_msg_size > 0) {
+        error_msg[0] = '\0';
+    }
+
     char path[PATH_MAX];
     if (!config_get_path(path, sizeof(path))) {
+        if (error_msg != NULL) {
+            snprintf(error_msg, error_msg_size, "Path too long");
+        }
         return;
     }
 
     FILE *fp = fopen(path, "r");
     if (fp == NULL) {
+        /* ENOENT is the ordinary first-run case (no config saved yet) -
+         * silently keep the defaults set above rather than alarming the
+         * user about a "missing" file that's expected not to exist yet.
+         * Any other failure (e.g. EACCES on a config directory some other
+         * process/tool mangled the permissions of) is real and worth
+         * surfacing, instead of the previous silent fall-back-to-defaults
+         * that looked identical to a successful load with no config file. */
+        if (errno != ENOENT && error_msg != NULL) {
+            snprintf(error_msg, error_msg_size, "Cannot open \"%s\": %s", path, strerror(errno));
+        }
         return;
     }
 
@@ -224,18 +241,31 @@ void config_load(Config *cfg)
     fclose(fp);
 }
 
-void config_save(const Config *cfg)
+void config_save(const Config *cfg, char *error_msg, size_t error_msg_size)
 {
+    if (error_msg != NULL && error_msg_size > 0) {
+        error_msg[0] = '\0';
+    }
+
     char dir[PATH_MAX];
     if (!config_get_dir(dir, sizeof(dir))) {
+        if (error_msg != NULL) {
+            snprintf(error_msg, error_msg_size, "Path too long");
+        }
         return;
     }
     if (mkdir(dir, 0755) != 0 && errno != EEXIST) {
+        if (error_msg != NULL) {
+            snprintf(error_msg, error_msg_size, "Cannot create \"%s\": %s", dir, strerror(errno));
+        }
         return;
     }
 
     char path[PATH_MAX];
     if (!config_get_path(path, sizeof(path))) {
+        if (error_msg != NULL) {
+            snprintf(error_msg, error_msg_size, "Path too long");
+        }
         return;
     }
 
@@ -251,19 +281,29 @@ void config_save(const Config *cfg)
     char tmp_path[PATH_MAX];
     int n = snprintf(tmp_path, sizeof(tmp_path), "%s.XXXXXX", path);
     if (n <= 0 || (size_t)n >= sizeof(tmp_path)) {
+        if (error_msg != NULL) {
+            snprintf(error_msg, error_msg_size, "Path too long");
+        }
         return;
     }
 
     int fd = mkstemp(tmp_path);
     if (fd == -1) {
+        if (error_msg != NULL) {
+            snprintf(error_msg, error_msg_size, "Cannot create \"%s\": %s", tmp_path, strerror(errno));
+        }
         return;
     }
     fchmod(fd, 0600);
 
     FILE *fp = fdopen(fd, "w");
     if (fp == NULL) {
+        int saved_errno = errno;
         close(fd);
         remove(tmp_path);
+        if (error_msg != NULL) {
+            snprintf(error_msg, error_msg_size, "Cannot write \"%s\": %s", tmp_path, strerror(saved_errno));
+        }
         return;
     }
 
@@ -295,12 +335,30 @@ void config_save(const Config *cfg)
 
 #undef WRITE_KV
 
+    if (!ok && error_msg != NULL) {
+        /* A WRITE_KV failure is either escape_value() truncation (a
+         * PATH_MAX-sized value that doesn't even fit after "\\" escaping)
+         * or an fprintf() failure - errno isn't reliably set for the
+         * latter until the stream is actually flushed, so this can't
+         * always distinguish the two, but it's still strictly more
+         * information than the previous silent failure. */
+        snprintf(error_msg, error_msg_size, "Could not write config data (value too long or a write error)");
+    }
+
     if (fclose(fp) != 0) {
+        if (ok && error_msg != NULL) {
+            /* A buffered write error (e.g. ENOSPC) can surface only here,
+             * after every fprintf() above appeared to succeed. */
+            snprintf(error_msg, error_msg_size, "Cannot write \"%s\": %s", tmp_path, strerror(errno));
+        }
         ok = 0;
     }
 
     if (ok && rename(tmp_path, path) == 0) {
         return;
+    }
+    if (ok && error_msg != NULL) {
+        snprintf(error_msg, error_msg_size, "Cannot save to \"%s\": %s", path, strerror(errno));
     }
     remove(tmp_path);
 }

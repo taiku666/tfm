@@ -141,6 +141,12 @@ static void show_error_dialog(const char *title, const char *message);
  * the g_idle_add() flush in activate()). */
 static char g_pending_panel_load_error[2][PATH_MAX * 2 + 64];
 
+/* Same "defer until the window is mapped" reasoning as
+ * g_pending_panel_load_error above, for a config_load() failure at
+ * startup - main() calls config_load() before activate() ever runs, so
+ * there is no window at all yet to parent a blocking dialog to. */
+static char g_pending_config_load_error[PATH_MAX + 64];
+
 /* Reloads panel with path. On a reload failure (panel already has a
  * valid path/listing), the old path/contents are left unchanged - same
  * fallback contract as the TUI's panel_reload(), for a transient error
@@ -447,7 +453,14 @@ static gboolean on_sigusr1(gpointer user_data)
     /* Reload tfm.ini, not just colors.toml - otherwise a mid-session
      * change to gui_theme (omarchy/system) would only take effect after
      * a restart. */
-    config_load(&g_cfg);
+    char reload_error[PATH_MAX + 64] = "";
+    config_load(&g_cfg, reload_error, sizeof(reload_error));
+    /* The main window is already mapped by the time SIGUSR1 can arrive
+     * (unlike the startup config_load() in main(), below) - safe to show
+     * the dialog directly instead of deferring it. */
+    if (reload_error[0] != '\0') {
+        show_error_dialog("Config warning", reload_error);
+    }
     apply_omarchy_theme();
     return G_SOURCE_CONTINUE;
 }
@@ -1617,6 +1630,10 @@ static gboolean flush_pending_panel_load_errors(gpointer user_data)
             g_pending_panel_load_error[i][0] = '\0';
         }
     }
+    if (g_pending_config_load_error[0] != '\0') {
+        show_error_dialog("Config warning", g_pending_config_load_error);
+        g_pending_config_load_error[0] = '\0';
+    }
     return G_SOURCE_REMOVE;
 }
 
@@ -1689,7 +1706,8 @@ static void activate(GtkApplication *app, gpointer user_data)
     focus_panel(0);
     gtk_window_present(GTK_WINDOW(window));
 
-    if (g_pending_panel_load_error[0][0] != '\0' || g_pending_panel_load_error[1][0] != '\0') {
+    if (g_pending_panel_load_error[0][0] != '\0' || g_pending_panel_load_error[1][0] != '\0' ||
+        g_pending_config_load_error[0] != '\0') {
         g_idle_add(flush_pending_panel_load_errors, NULL);
     }
 }
@@ -1712,7 +1730,15 @@ static void on_shutdown(GApplication *app, gpointer user_data)
     if (g_panel[1].path[0] != '\0') {
         snprintf(g_cfg.right_path, sizeof(g_cfg.right_path), "%s", g_panel[1].path);
     }
-    config_save(&g_cfg);
+    /* The window is already going away by the time "shutdown" fires -
+     * same reasoning as the TUI's exit-path config_save(): no UI left to
+     * show a dialog in, so report a failure to stderr instead (visible
+     * if tfm-gui was launched from a terminal). */
+    char save_error[PATH_MAX + 64] = "";
+    config_save(&g_cfg, save_error, sizeof(save_error));
+    if (save_error[0] != '\0') {
+        fprintf(stderr, "tfm-gui: failed to save config: %s\n", save_error);
+    }
 }
 
 int main(int argc, char **argv)
@@ -1736,7 +1762,7 @@ int main(int argc, char **argv)
      * and this must happen before the first panel is loaded below. */
     setlocale(LC_ALL, "");
 
-    config_load(&g_cfg);
+    config_load(&g_cfg, g_pending_config_load_error, sizeof(g_pending_config_load_error));
     g_default_font_size = read_terminal_font_size();
     g_font_size = g_default_font_size;
 

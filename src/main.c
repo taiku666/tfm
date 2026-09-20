@@ -287,7 +287,8 @@ int main(int argc, char *argv[])
     splash_show("TFM", "Taiku File Manager");
 
     Config cfg;
-    config_load(&cfg);
+    char config_load_error[TUI_MSG_BUFFER_SIZE] = "";
+    config_load(&cfg, config_load_error, sizeof(config_load_error));
 
     screen_set_fancy_style(strcasecmp(cfg.icons, "omarchy") == 0);
     screen_set_progress_bar_color(cfg.border_color);
@@ -320,6 +321,11 @@ int main(int argc, char *argv[])
     input_enable_raw_mode();
 
     redraw_ui(&cfg, &panel_left, &panel_right, focus, cmd_buffer);
+
+    if (config_load_error[0] != '\0') {
+        tui_show_popup("Config warning", config_load_error);
+        redraw_ui(&cfg, &panel_left, &panel_right, focus, cmd_buffer);
+    }
 
     /* Report invalid color names in tfm.ini instead of silently falling
      * back. */
@@ -754,7 +760,15 @@ int main(int argc, char *argv[])
     /* No screen_clear() needed here: leaving the alt screen buffer
      * (atexit) restores the previous terminal content automatically. */
 
-    config_save(&cfg);
+    /* The alt-screen buffer is already gone by this point (see the
+     * comment above) and raw mode is off, so there's no TUI left to show
+     * a popup in - report a save failure to stderr instead, visible in
+     * the shell tfm returns control to. */
+    char config_save_error[TUI_MSG_BUFFER_SIZE] = "";
+    config_save(&cfg, config_save_error, sizeof(config_save_error));
+    if (config_save_error[0] != '\0') {
+        fprintf(stderr, "tfm: failed to save config: %s\n", config_save_error);
+    }
 
     return 0;
 }
