@@ -37,10 +37,10 @@ static int compare_names_locale_aware(const char *a, const char *b)
     wa[na] = L'\0';
     wb[nb] = L'\0';
     for (size_t i = 0; i < na; i++) {
-        wa[i] = towlower(wa[i]);
+        wa[i] = (wchar_t)towlower((wint_t)wa[i]);
     }
     for (size_t i = 0; i < nb; i++) {
-        wb[i] = towlower(wb[i]);
+        wb[i] = (wchar_t)towlower((wint_t)wb[i]);
     }
     return wcscoll(wa, wb);
 }

@@ -1,6 +1,6 @@
 CC = gcc
 CSTD = -std=c11
-WARN_FLAGS = -Wall -Wextra -Wpedantic
+WARN_FLAGS = -Wall -Wextra -Wpedantic -Wconversion -Wshadow
 
 # CFLAGS is user/CI-overridable (e.g. `make CFLAGS=-O2` or
 # `make CFLAGS='-fsanitize=address,undefined -g'`); the warning flags and

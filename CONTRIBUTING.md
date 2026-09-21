@@ -26,7 +26,8 @@ make asan-test  # unit-test rebuilt with -fsanitize=address,undefined
 ## Before submitting a change
 
 - Build both `tfm` and `tfm-gui` with zero warnings
-  (`-Wall -Wextra -Wpedantic`, the default flags), and keep `make test`
+  (`-Wall -Wextra -Wpedantic -Wconversion -Wshadow`, the default flags),
+  and keep `make test`
   and `make asan-test` passing.
 - For anything touching `src/fileops.c`, `src/tfm_common.c`,
   `src/config.c`, `src/input.c`, or `src/dir.c`: add or extend the
