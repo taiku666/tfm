@@ -1,5 +1,7 @@
 # TFM — Taiku File Manager
 
+[![CI](https://github.com/taiku666/tfm/actions/workflows/ci.yml/badge.svg)](https://github.com/taiku666/tfm/actions/workflows/ci.yml)
+
 A dual-panel terminal file manager written in C, built for
 Omarchy/Hyprland. Ships **two front-ends that share one core**: a
 dependency-free terminal UI, and an optional GTK4/libadwaita GUI that

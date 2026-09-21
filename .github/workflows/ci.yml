@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GUI + lint dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev cppcheck
+
+      # CFLAGS=-Werror here (not baked into the Makefile's own defaults)
+      # automates CONTRIBUTING.md's "build with zero warnings" requirement
+      # for tfm's own code: any new warning in src/ or tests/ fails the
+      # build instead of relying on a human noticing it. Deliberately not
+      # applied to `make asan-test` below - its own
+      # `CFLAGS = -fsanitize=address,undefined -g -O0` is a target-specific
+      # variable, and a command-line CFLAGS would win over it and silently
+      # strip the sanitizer flags instead of adding to them. Since this
+      # step already proves the exact same source is warning-free,
+      # asan-test re-warns (still with -Wall -Wextra -Wpedantic) but
+      # doesn't need to re-prove it.
+      - name: Build tfm and run the unit test suite (-Werror)
+        run: make CFLAGS=-Werror test
+
+      # Slower, real-binary integration tests (spawns bin/tfm in a pty) -
+      # reuses the bin/tfm just built above rather than rebuilding.
+      - name: PTY integration tests
+        run: make test-pty
+
+      # No -Werror here: GTK4's own headers (gtkaccessiblehypertext.h, as
+      # of the version in this runner's package repo) already emit a
+      # -Wpedantic warning ("ISO C does not allow extra ';' outside of a
+      # function") independent of anything tfm-gui itself does - confirmed
+      # present in a plain `make tfm-gui` with no changes at all.
+      # Upgrading that to -Werror would fail CI on a third-party header,
+      # not on tfm's own code, so tfm-gui is still built and exercised
+      # here, just without the stricter flag applied to the TUI above.
+      - name: Build tfm-gui
+        run: make tfm-gui
+
+      # Rebuilds everything from scratch under -fsanitize=address,undefined
+      # (asan-test's own `clean` prerequisite handles that) - catches
+      # memory/UB bugs the plain build and Werror can't.
+      - name: ASan/UBSan unit test suite
+        run: make asan-test
+
+      - name: Lint (cppcheck)
+        run: make lint

@@ -29,6 +29,17 @@ CORE_OBJS = $(patsubst %.c,$(BUILD_DIR)/%.o,$(CORE_SRCS))
 GUI_SRCS = $(wildcard $(GUI_SRC_DIR)/*.c)
 GUI_OBJS = $(patsubst $(GUI_SRC_DIR)/%.c,$(GUI_BUILD_DIR)/%.o,$(GUI_SRCS))
 
+# Automated unit tests (tests/test_*.c). Each one is its own self-contained
+# test binary (its own main(), via tests/test.h) linked against the real
+# $(CORE_OBJS) - so tests run against the actual compiled fileops.c/
+# tfm_common.c/etc, not a reimplementation - rather than one combined
+# binary, so a crash or exit() in one test file's process can't take out
+# unrelated test files.
+TEST_DIR = tests
+TEST_BUILD_DIR = $(BUILD_DIR)/tests
+TEST_SRCS = $(wildcard $(TEST_DIR)/test_*.c)
+TEST_BINS = $(patsubst $(TEST_DIR)/%.c,$(TEST_BUILD_DIR)/%,$(TEST_SRCS))
+
 # Auto-generated header-dependency files (see -MMD -MP below): included at
 # the bottom so editing a header (e.g. include/panel.h) correctly triggers
 # a rebuild of every .c file that includes it, not just the ones make's
@@ -50,7 +61,7 @@ OMARCHY_HOOK_DIR = $(HOME)/.config/omarchy/hooks/theme-set.d
 OMARCHY_HOOK_SRC = contrib/omarchy-hooks/tfm-gui-reload-theme
 
 .PHONY: all clean install uninstall tfm-gui check-gtk-deps install-gui uninstall-gui \
-        install-gui-theme-hook uninstall-gui-theme-hook test lint asan
+        install-gui-theme-hook uninstall-gui-theme-hook test unit-test smoke-test test-pty lint asan asan-test
 
 all: $(TARGET)
 
@@ -123,13 +134,64 @@ uninstall-gui-theme-hook:
 	rm -f $(OMARCHY_HOOK_DIR)/tfm-gui-reload-theme
 	@echo "Removed: $(OMARCHY_HOOK_DIR)/tfm-gui-reload-theme"
 
-# No automated test suite exists yet (see CODE_REVIEW.md's "Suggested test
-# plan" section) - this is a smoke test, not a substitute for it: builds
-# both binaries and checks --version/--help exit cleanly.
-test: all
+# Builds both binaries and checks --version/--help exit cleanly - a sanity
+# check that the binary starts up and parses its own flags, not a
+# substitute for unit-test below.
+smoke-test: all
 	@./$(TARGET) --version >/dev/null && echo "tfm --version: OK"
 	@./$(TARGET) --help >/dev/null && echo "tfm --help: OK"
-	@echo "Smoke test passed. No automated fileops/input test suite exists yet."
+	@echo "Smoke test passed."
+
+$(TEST_BUILD_DIR):
+	mkdir -p $(TEST_BUILD_DIR)
+
+# Each tests/test_*.c is its own self-contained binary (own main(), via
+# tests/test.h) linked against the real $(CORE_OBJS) - so tests exercise
+# the actual compiled fileops.c/tfm_common.c/etc, not a reimplementation.
+# Same $(ALL_CFLAGS) $(IFLAGS) as the main pattern rule, so a test file
+# that needs _GNU_SOURCE (e.g. for unshare()) picks up the same warning
+# flags/std as the rest of the project automatically.
+#
+# input.c is TUI-only (not part of $(CORE_OBJS), which is the frontend-
+# agnostic set shared with the GUI) - EXTRA_OBJS lets test_input link
+# against it too without pulling it into every other test binary that
+# doesn't need it. The extra prerequisite line below (rather than adding
+# $(EXTRA_OBJS) to the pattern rule's own prerequisite list) is
+# deliberate: a target-specific variable isn't reliably expanded while
+# make computes a pattern rule's prerequisites, only within its recipe -
+# a separate prerequisite-only rule for the same target is the standard,
+# reliable way to add "build this first" without a recipe of its own.
+$(TEST_BUILD_DIR)/test_input: EXTRA_OBJS = $(BUILD_DIR)/input.o
+$(TEST_BUILD_DIR)/test_input: $(BUILD_DIR)/input.o
+
+$(TEST_BUILD_DIR)/%: $(TEST_DIR)/%.c $(CORE_OBJS) | $(TEST_BUILD_DIR)
+	$(CC) $(ALL_CFLAGS) $(IFLAGS) $< $(CORE_OBJS) $(EXTRA_OBJS) -o $@
+
+# Builds and runs every tests/test_*.c binary; fails (non-zero exit) if
+# any test in any of them fails.
+unit-test: $(TEST_BINS)
+	@for t in $(TEST_BINS); do \
+		echo "--- $$t ---"; \
+		./$$t || exit 1; \
+	done
+
+test: unit-test smoke-test
+
+# Slower, separate from unit-test/test: spawns the real compiled bin/tfm
+# in a pseudo-terminal (forkpty()) to exercise signal/EOF/terminal-restore
+# behavior no source-linked unit test can reach - see
+# tests/pty_test_main.c's own header comment. Deliberately not named
+# tests/test_*.c, so unit-test/test/asan-test never pick it up. -lutil
+# for forkpty() portability to older glibc that hasn't merged it into
+# libc yet (harmless where it's already merged).
+PTY_TEST_SRC = $(TEST_DIR)/pty_test_main.c
+PTY_TEST_BIN = $(TEST_BUILD_DIR)/pty_test_main
+
+$(PTY_TEST_BIN): $(PTY_TEST_SRC) $(TARGET) | $(TEST_BUILD_DIR)
+	$(CC) $(ALL_CFLAGS) $(IFLAGS) $(PTY_TEST_SRC) -lutil -o $@
+
+test-pty: $(PTY_TEST_BIN)
+	./$(PTY_TEST_BIN)
 
 # Best-effort static analysis; skipped (not failed) if cppcheck isn't
 # installed, so `make lint` is safe to run/CI-wire on any machine.
@@ -142,3 +204,9 @@ lint:
 # optimized/plain build - run bin/tfm under it manually.
 asan: CFLAGS = -fsanitize=address,undefined -g -O0
 asan: clean $(TARGET)
+
+# Same idea as `make asan`, but for the unit-test binaries instead of the
+# TUI - `clean` first so no plain object left over from a prior `make`/
+# `make test` gets linked into an ASan binary.
+asan-test: CFLAGS = -fsanitize=address,undefined -g -O0
+asan-test: clean unit-test
