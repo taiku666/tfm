@@ -165,3 +165,8 @@ size_t utf8_prev_char_len(const char *buf, size_t len)
     }
     return len - new_len;
 }
+
+__attribute__((noinline)) const char *unsized(const char *str)
+{
+    return str;
+}

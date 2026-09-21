@@ -20,11 +20,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev libadwaita-1-dev cppcheck
 
-      # CFLAGS=-Werror here (not baked into the Makefile's own defaults)
-      # automates CONTRIBUTING.md's "build with zero warnings" requirement
-      # for tfm's own code: any new warning in src/ or tests/ fails the
-      # build instead of relying on a human noticing it. Deliberately not
-      # applied to `make asan-test` below - its own
+      # -Werror here (not baked into the Makefile's own defaults) automates
+      # CONTRIBUTING.md's "build with zero warnings" requirement for tfm's
+      # own code: any new warning in src/ or tests/ fails the build instead
+      # of relying on a human noticing it. -O2 -D_FORTIFY_SOURCE=2 is
+      # repeated explicitly (matching the Makefile's own CFLAGS default)
+      # because a command-line CFLAGS replaces that default outright rather
+      # than adding to it - omitting them here would silently test an
+      # unoptimized, non-fortified build instead of what `make` actually
+      # ships. Deliberately not applied to `make asan-test` below - its own
       # `CFLAGS = -fsanitize=address,undefined -g -O0` is a target-specific
       # variable, and a command-line CFLAGS would win over it and silently
       # strip the sanitizer flags instead of adding to them. Since this
@@ -32,7 +36,7 @@ jobs:
       # asan-test re-warns (still with -Wall -Wextra -Wpedantic) but
       # doesn't need to re-prove it.
       - name: Build tfm and run the unit test suite (-Werror)
-        run: make CFLAGS=-Werror test
+        run: make CFLAGS='-Werror -O2 -D_FORTIFY_SOURCE=2' test
 
       # Slower, real-binary integration tests (spawns bin/tfm in a pty) -
       # reuses the bin/tfm just built above rather than rebuilding.

@@ -43,4 +43,21 @@ int builtin_cd(char *current_dir, const char *command, char *error_msg, size_t e
  * unconditionally without a separate "len > 0" guard underflowing. */
 size_t utf8_prev_char_len(const char *buf, size_t len);
 
+/* Returns str unchanged, as a plain, unsized `const char *` at the call
+ * site. Exists only to suppress a GCC -Wformat-truncation false positive
+ * (seen building with -O2 -D_FORTIFY_SOURCE=2, invisible at -O0): when a
+ * snprintf() source is provably bounded to fit the destination by an
+ * invariant the analysis can't see - e.g. two buffers deliberately the
+ * same declared size, or a pointer offset bounded by a preceding loop -
+ * GCC still assumes the worst case if it can trace the source back to a
+ * fixed-size array. Routing the source through this function first hides
+ * that array from the analysis. __attribute__((noinline)) is load-
+ * bearing, not decorative: a plain static function gets inlined at -O2,
+ * letting the analysis see straight through it and reintroducing the
+ * exact false positive this exists to remove. Only ever call this where
+ * the surrounding code already guarantees the copy fits - it does
+ * nothing to actually prevent truncation, and the reasoning for why the
+ * copy is safe belongs in a comment at each call site, not here. */
+__attribute__((noinline)) const char *unsized(const char *str);
+
 #endif

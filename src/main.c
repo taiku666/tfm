@@ -705,10 +705,19 @@ int main(int argc, char *argv[])
                 } else if (enter_selected_entry(active_panel, enter_error, sizeof(enter_error))) {
                     if (active_panel == &panel_left) {
                         if (!left_path_is_actual) {
-                            snprintf(cfg.left_path, sizeof(cfg.left_path), "%s", active_panel->path);
+                            /* cfg.left_path/right_path and Panel.path are
+                             * both declared char[PATH_MAX] - this copy can
+                             * never truncate, but GCC's -Wformat-truncation
+                             * (at -O2 with _FORTIFY_SOURCE=2) can't see that
+                             * fact through the active_panel->path struct-
+                             * pointer access and assumes an unbounded
+                             * source; unsized() (tfm_common.h) hides the
+                             * array from that analysis at every occurrence
+                             * of this copy below too. */
+                            snprintf(cfg.left_path, sizeof(cfg.left_path), "%s", unsized(active_panel->path));
                         }
                     } else {
-                        snprintf(cfg.right_path, sizeof(cfg.right_path), "%s", active_panel->path);
+                        snprintf(cfg.right_path, sizeof(cfg.right_path), "%s", unsized(active_panel->path));
                     }
                     redraw_ui(&cfg, &panel_left, &panel_right, focus, cmd_buffer);
                 } else if (enter_error[0] != '\0') {
@@ -730,10 +739,10 @@ int main(int argc, char *argv[])
                         panel_reload(active_panel);
                         if (active_panel == &panel_left) {
                             if (!left_path_is_actual) {
-                                snprintf(cfg.left_path, sizeof(cfg.left_path), "%s", active_panel->path);
+                                snprintf(cfg.left_path, sizeof(cfg.left_path), "%s", unsized(active_panel->path));
                             }
                         } else {
-                            snprintf(cfg.right_path, sizeof(cfg.right_path), "%s", active_panel->path);
+                            snprintf(cfg.right_path, sizeof(cfg.right_path), "%s", unsized(active_panel->path));
                         }
                     }
                 } else {

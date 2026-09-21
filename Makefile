@@ -2,11 +2,24 @@ CC = gcc
 CSTD = -std=c11
 WARN_FLAGS = -Wall -Wextra -Wpedantic -Wconversion -Wshadow
 
-# CFLAGS is user/CI-overridable (e.g. `make CFLAGS=-O2` or
-# `make CFLAGS='-fsanitize=address,undefined -g'`); the warning flags and
-# language standard above are not part of it, so overriding CFLAGS can't
-# accidentally drop them.
-CFLAGS ?=
+# CFLAGS is user/CI-overridable (e.g. `make CFLAGS='-O0 -g'` for a
+# debug build, or `make CFLAGS='-fsanitize=address,undefined -g'`); the
+# warning flags and language standard above are not part of it, so
+# overriding CFLAGS can't accidentally drop them.
+#
+# Default -O2: release binaries (built via plain `make`, including the
+# ones attached to GitHub releases) were previously unoptimized (-O0,
+# the implicit default with no -O flag at all) with no one having
+# deliberately decided that. -D_FORTIFY_SOURCE=2 is a no-op without at
+# least -O1 (its checks need __builtin_object_size, which needs
+# optimization info to resolve) - now that there's a default -O2, it
+# does something. Together these surfaced 5 real warnings invisible at
+# -O0: two ignored chown()/fchown() return values (now handled properly,
+# were already deliberately best-effort) and three genuine
+# -Wformat-truncation false positives from GCC losing precise bound
+# info through a struct-pointer/pointer-offset access - see unsized()
+# in tfm_common.h for how those are suppressed without hiding a real bug.
+CFLAGS ?= -O2 -D_FORTIFY_SOURCE=2
 ALL_CFLAGS = $(WARN_FLAGS) $(CSTD) $(CFLAGS)
 
 IFLAGS = -Iinclude

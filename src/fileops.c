@@ -353,8 +353,11 @@ static int copy_file(const char *src_path, const char *dest_path, CopyProgress *
                  * instead of silently reassigning everything to root.
                  * Failure (EPERM) is expected and ignored - there is no
                  * Retry/Skip/Abort question to ask the user here, this is
-                 * metadata preservation, not the operation itself. */
-                fchown(fileno(out), src_st.st_uid, src_st.st_gid);
+                 * metadata preservation, not the operation itself. (void)
+                 * does NOT silence glibc's warn_unused_result on this
+                 * function - an empty if-body is the actual idiom. */
+                if (fchown(fileno(out), src_st.st_uid, src_st.st_gid) != 0) {
+                }
 
                 /* Best-effort: preserve mtime/atime so a copy doesn't
                  * look "just modified" (breaks incremental-backup tools,
@@ -590,8 +593,11 @@ static int copy_recursive_impl(const char *src, const char *dest, CopyProgress *
              * a root-run backup/restore. Directory mtime is deliberately
              * NOT restored here: it will be repeatedly overwritten as
              * this directory's own entries are copied into it below, so
-             * setting it now would just be discarded. */
-            chown(dest, st.st_uid, st.st_gid);
+             * setting it now would just be discarded. (void) does NOT
+             * silence glibc's warn_unused_result on this function - an
+             * empty if-body is the actual idiom. */
+            if (chown(dest, st.st_uid, st.st_gid) != 0) {
+            }
             break;
         }
         int mkdir_errno = errno;

@@ -648,7 +648,17 @@ void screen_draw_progress_popup(const char *title, const char *item, double perc
             col++;
         }
         char truncated[PATH_MAX + 4];
-        snprintf(truncated, sizeof(truncated), "...%s", item_display + cut);
+        /* utf8_visual_width() above and this loop count codepoints the
+         * same way (1 per non-continuation-byte, per utf8_visual_width()'s
+         * own comment) - since the entry condition already guarantees
+         * item_display has strictly more than `keep` codepoints, this
+         * loop can never exhaust cut to 0 before col reaches keep, so
+         * "..." + item_display+cut always fits comfortably under
+         * PATH_MAX+4. GCC's -Wformat-truncation (at -O2 with
+         * _FORTIFY_SOURCE=2) can't see that cross-loop invariant and
+         * assumes the cut==0 worst case instead; unsized() (tfm_common.h)
+         * hides item_display's array bound from that analysis. */
+        snprintf(truncated, sizeof(truncated), "...%s", unsized(item_display + cut));
         snprintf(item_display, sizeof(item_display), "%s", truncated);
     }
 
