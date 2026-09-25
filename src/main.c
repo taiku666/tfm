@@ -162,12 +162,7 @@ static int enter_selected_entry(Panel *panel, char *error_msg, size_t error_msg_
     char synthetic_cmd[TUI_MSG_BUFFER_SIZE];
     snprintf(synthetic_cmd, sizeof(synthetic_cmd), "cd %s", entry->name);
 
-    if (!builtin_cd(panel->path, synthetic_cmd, error_msg, error_msg_size)) {
-        return 0;
-    }
-
-    panel_reload(panel);
-    return 1;
+    return panel_change_dir(panel, synthetic_cmd, error_msg, error_msg_size);
 }
 
 /* fileops.c is UI-agnostic (see fileops.h) and calls these callbacks for
@@ -733,10 +728,9 @@ int main(int argc, char *argv[])
                 char error_message[CMD_BUFFER_SIZE + 32] = "";
 
                 if (is_cd_command(cmd_buffer)) {
-                    if (!builtin_cd(active_panel->path, cmd_buffer, error_message, sizeof(error_message))) {
+                    if (!panel_change_dir(active_panel, cmd_buffer, error_message, sizeof(error_message))) {
                         show_error = 1;
                     } else {
-                        panel_reload(active_panel);
                         if (active_panel == &panel_left) {
                             if (!left_path_is_actual) {
                                 snprintf(cfg.left_path, sizeof(cfg.left_path), "%s", unsized(active_panel->path));

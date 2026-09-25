@@ -1,5 +1,6 @@
 #include "panel.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -86,7 +87,7 @@ void panel_init(Panel *panel, const char *path)
     panel_reload(panel);
 }
 
-void panel_reload(Panel *panel)
+int panel_reload(Panel *panel)
 {
     DirEntryInfo *new_entries = NULL;
     size_t new_count = 0;
@@ -95,7 +96,16 @@ void panel_reload(Panel *panel)
         /* A failed reload (dir deleted/unmounted, permissions revoked...)
          * must not destroy a still-valid existing listing. If there are
          * no entries at all yet (e.g. an invalid path saved in tfm.ini),
-         * synthesize a ".." entry so the panel isn't a dead end. */
+         * synthesize a ".." entry so the panel isn't a dead end.
+         *
+         * scroll_offset/selected_index are deliberately left alone when
+         * the old listing is kept: they still index that same, unchanged
+         * listing, so they stay valid - and resetting them used to throw
+         * the user back to the top of a long listing for nothing more
+         * than a transient reload error (CR4-M4b). Only the synthesized
+         * one-entry fallback needs them reset, since it replaces an
+         * empty listing whose indices meant nothing. */
+        int saved_errno = errno;
         if (panel->entries == NULL) {
             DirEntryInfo *fallback = malloc(sizeof(DirEntryInfo));
             if (fallback != NULL) {
@@ -104,10 +114,11 @@ void panel_reload(Panel *panel)
                 panel->entries = fallback;
                 panel->count = 1;
             }
+            panel->scroll_offset = 0;
+            panel->selected_index = 0;
         }
-        panel->scroll_offset = 0;
-        panel->selected_index = 0;
-        return;
+        errno = saved_errno;
+        return 0;
     }
 
     if (panel->entries != NULL) {
@@ -117,6 +128,45 @@ void panel_reload(Panel *panel)
     panel->count = new_count;
     panel->scroll_offset = 0;
     panel->selected_index = 0;
+    return 1;
+}
+
+int panel_change_dir(Panel *panel, const char *command, char *error_msg, size_t error_msg_size)
+{
+    /* Resolved into a scratch copy, not panel->path itself: builtin_cd()
+     * rewrites the buffer it's given on success, and doing that to
+     * panel->path directly (as both call sites in main.c used to) meant a
+     * dir_list() failure right afterwards - builtin_cd()'s own opendir()
+     * probe passed, but the directory vanished/lost its permissions/hit
+     * an I/O error in between - left panel_draw() showing the NEW path
+     * above the OLD listing with no error at all, and main.c then
+     * persisted that never-actually-entered path into tfm.ini on quit
+     * (CR4-M4). Now the path and listing are only ever swapped together,
+     * after both have succeeded. */
+    char new_path[PATH_MAX];
+    snprintf(new_path, sizeof(new_path), "%s", unsized(panel->path));
+    if (!builtin_cd(new_path, command, error_msg, error_msg_size)) {
+        return 0;
+    }
+
+    DirEntryInfo *new_entries = NULL;
+    size_t new_count = 0;
+    if (dir_list(new_path, &new_entries, &new_count) != 0) {
+        if (error_msg != NULL) {
+            snprintf(error_msg, error_msg_size, "Cannot read directory: %s", strerror(errno));
+        }
+        return 0;
+    }
+
+    if (panel->entries != NULL) {
+        dir_list_free(panel->entries);
+    }
+    snprintf(panel->path, sizeof(panel->path), "%s", new_path);
+    panel->entries = new_entries;
+    panel->count = new_count;
+    panel->scroll_offset = 0;
+    panel->selected_index = 0;
+    return 1;
 }
 
 void panel_free(Panel *panel)

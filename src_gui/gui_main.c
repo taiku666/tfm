@@ -159,14 +159,16 @@ static char g_pending_config_load_error[PATH_MAX + 64];
  * g_pending_panel_load_error above) and falls back once to $HOME (or "/"
  * as a last resort). panel_index selects which of the two panels' pending-
  * message slots to use; it's only consulted on this initial-failure path
- * (panel_load()'s only other caller with an unset panel->path). */
-static void panel_load_indexed(GuiPanel *panel, const char *path, int panel_index)
+ * (panel_load()'s only other caller with an unset panel->path). Returns
+ * 1 if panel now shows path (or, on the initial-load case, the $HOME/"/"
+ * fallback), 0 if nothing was loaded and panel is unchanged. */
+static int panel_load_indexed(GuiPanel *panel, const char *path, int panel_index)
 {
     DirEntryInfo *entries = NULL;
     size_t count = 0;
     if (dir_list(path, &entries, &count) != 0) {
         if (panel->path[0] != '\0') {
-            return;
+            return 0;
         }
 
         int saved_errno = errno;
@@ -177,7 +179,7 @@ static void panel_load_indexed(GuiPanel *panel, const char *path, int panel_inde
 
         if (strcmp(fallback, path) == 0 || dir_list(fallback, &entries, &count) != 0) {
             snprintf(out, out_size, "Could not open \"%s\": %s", path, strerror(saved_errno));
-            return;
+            return 0;
         }
 
         snprintf(out, out_size, "Could not open \"%s\": %s\nFalling back to \"%s\".", path,
@@ -239,6 +241,7 @@ static void panel_load_indexed(GuiPanel *panel, const char *path, int panel_inde
     if (panel->path_label != NULL) {
         gtk_label_set_label(GTK_LABEL(panel->path_label), panel->path);
     }
+    return 1;
 }
 
 /* Every caller except build_panel_widget()'s initial load already has a
@@ -246,9 +249,9 @@ static void panel_load_indexed(GuiPanel *panel, const char *path, int panel_inde
  * panel_load_indexed()'s initial-failure branch - the only place
  * panel_index is read - can never trigger here; the index value is
  * irrelevant. */
-static void panel_load(GuiPanel *panel, const char *path)
+static int panel_load(GuiPanel *panel, const char *path)
 {
-    panel_load_indexed(panel, path, 0);
+    return panel_load_indexed(panel, path, 0);
 }
 
 static void panel_navigate_into(GuiPanel *panel, const char *name)
@@ -633,14 +636,28 @@ static void on_shell_entry_activate(GtkEntry *entry, gpointer user_data)
     GuiPanel *active = &g_panel[g_focused_panel];
 
     if (gui_is_cd_command(command)) {
+        /* Resolved into a scratch copy, not active->path itself - same
+         * reasoning as the TUI's panel_change_dir() (CR4-M4): builtin_cd()
+         * rewrites the buffer it's given, and panel_load() keeps the old
+         * listing on failure, so resolving in place meant a directory that
+         * passed builtin_cd()'s opendir() probe but then failed to list
+         * left the path label showing the new path over the old listing,
+         * and on_shutdown() persisted that never-entered path. panel_load()
+         * only writes panel->path once the listing has actually loaded. */
+        char new_path[PATH_MAX];
         char error_msg[128];
-        if (!builtin_cd(active->path, command, error_msg, sizeof(error_msg))) {
+        snprintf(new_path, sizeof(new_path), "%s", active->path);
+        if (!builtin_cd(new_path, command, error_msg, sizeof(error_msg))) {
+            show_error_dialog("Error", error_msg);
+        } else if (!panel_load(active, new_path)) {
+            snprintf(error_msg, sizeof(error_msg), "Cannot read directory: %s", strerror(errno));
             show_error_dialog("Error", error_msg);
         }
-        /* No panel_load() here on success: both panels are unconditionally
-         * reloaded below (a plain shell command can also touch either
-         * panel's directory), so reloading `active` here too would just
-         * do the same opendir()+readdir()+stat() listing twice. */
+        /* The unconditional reload of both panels below re-lists `active`
+         * a second time after a successful cd - one redundant listing, but
+         * the alternative (loading the new path only there) can't report a
+         * failure, so it's the cost of never showing a path that wasn't
+         * actually entered. */
     } else {
         /* shell_execute() waits via a single blocking waitpid() with no
          * event pumping (pump == NULL) - tfm-gui is single-threaded, so

@@ -35,8 +35,18 @@ typedef struct {
 /* Initializes panel with path and loads its contents. */
 void panel_init(Panel *panel, const char *path);
 
-/* Reloads the current directory (panel->path). */
-void panel_reload(Panel *panel);
+/* Reloads the current directory (panel->path). Returns 1 on success. On
+ * failure returns 0 (errno set by dir_list()) and keeps the previous
+ * listing and cursor/scroll position intact, or - if there was no listing
+ * yet - installs a single ".." entry so the panel isn't a dead end. */
+int panel_reload(Panel *panel);
+
+/* Runs a "cd ..." command (see builtin_cd()) against panel and, only if
+ * both resolving the target and listing it succeed, switches panel->path
+ * and its listing together. Returns 1 on success; on failure returns 0,
+ * writes a reason into error_msg, and leaves the panel (path, listing,
+ * cursor) completely unchanged. */
+int panel_change_dir(Panel *panel, const char *command, char *error_msg, size_t error_msg_size);
 
 /* Frees resources held by panel. */
 void panel_free(Panel *panel);

@@ -177,8 +177,18 @@ $(TEST_BUILD_DIR):
 $(TEST_BUILD_DIR)/test_input: EXTRA_OBJS = $(BUILD_DIR)/input.o
 $(TEST_BUILD_DIR)/test_input: $(BUILD_DIR)/input.o
 
+# panel.c is TUI-only too, and draws through screen.c (which in turn
+# reads the terminal size via input.c) - all three are linked in, though
+# the tests themselves never draw. --wrap=dir_list reroutes panel.o's
+# dir_list() calls through a fault-injection shim in tests/test_panel.c
+# (see the comment there) while dir.o's real implementation stays
+# reachable as __real_dir_list.
+$(TEST_BUILD_DIR)/test_panel: EXTRA_OBJS = $(BUILD_DIR)/panel.o $(BUILD_DIR)/screen.o $(BUILD_DIR)/input.o
+$(TEST_BUILD_DIR)/test_panel: EXTRA_LDFLAGS = -Wl,--wrap=dir_list
+$(TEST_BUILD_DIR)/test_panel: $(BUILD_DIR)/panel.o $(BUILD_DIR)/screen.o $(BUILD_DIR)/input.o
+
 $(TEST_BUILD_DIR)/%: $(TEST_DIR)/%.c $(CORE_OBJS) | $(TEST_BUILD_DIR)
-	$(CC) $(ALL_CFLAGS) $(IFLAGS) $< $(CORE_OBJS) $(EXTRA_OBJS) -o $@
+	$(CC) $(ALL_CFLAGS) $(IFLAGS) $< $(CORE_OBJS) $(EXTRA_OBJS) $(EXTRA_LDFLAGS) -o $@
 
 # Builds and runs every tests/test_*.c binary; fails (non-zero exit) if
 # any test in any of them fails.
