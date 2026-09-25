@@ -18,7 +18,7 @@ jobs:
       - name: Install GUI + lint dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev cppcheck
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev cppcheck clang-tools
 
       # -Werror here (not baked into the Makefile's own defaults) automates
       # CONTRIBUTING.md's "build with zero warnings" requirement for tfm's
@@ -62,3 +62,8 @@ jobs:
 
       - name: Lint (cppcheck)
         run: make lint
+
+      # Clang static analyzer (scan-build) over bin/tfm + bin/tfm-gui;
+      # fails on any finding. Runs last since it starts with `make clean`.
+      - name: Static analysis (scan-build)
+        run: make scan

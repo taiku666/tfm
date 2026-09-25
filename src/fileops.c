@@ -310,6 +310,18 @@ static int copy_file(const char *src_path, const char *dest_path, CopyProgress *
                 report_progress(cb, "Copying...", dest_path, progress_percent(progress));
                 progress->last_reported_percent = percent_int;
             }
+
+            /* fread() only returns a short count at EOF or on a read
+             * error (C11 7.21.8.1), and ferror() below tells the two
+             * apart - so stop here instead of issuing one more fread()
+             * that can only return 0. Behavior is identical either way;
+             * this just gives clang's unix.Stream checker (scan-build)
+             * a loop shape it can follow, instead of it flagging the
+             * extra call as "read in EOF state" - a false positive that
+             * otherwise kept `make scan` from ever being clean. */
+            if (n < sizeof(buffer)) {
+                break;
+            }
         }
         if (!failed && ferror(in)) {
             /* fread() returning 0 means either clean EOF or a read

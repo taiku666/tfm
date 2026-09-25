@@ -73,7 +73,7 @@ DESTDIR ?=
 OMARCHY_HOOK_DIR = $(HOME)/.config/omarchy/hooks/theme-set.d
 OMARCHY_HOOK_SRC = contrib/omarchy-hooks/tfm-gui-reload-theme
 
-.PHONY: all clean install uninstall tfm-gui check-gtk-deps install-gui uninstall-gui \
+.PHONY: scan all clean install uninstall tfm-gui check-gtk-deps install-gui uninstall-gui \
         install-gui-theme-hook uninstall-gui-theme-hook test unit-test smoke-test test-pty lint asan asan-test
 
 all: $(TARGET)
@@ -229,6 +229,22 @@ lint:
 	@command -v cppcheck >/dev/null 2>&1 && \
 		cppcheck --enable=warning,style --std=c11 -Iinclude --suppress=missingIncludeSystem \
 			$(SRC_DIR) || echo "cppcheck not installed, skipping."
+
+# Clang static analyzer over both shipped binaries. Skipped (not failed)
+# if scan-build isn't installed, same as `lint`. --status-bugs makes any
+# finding a non-zero exit, so CI can gate on it. `clean` first: scan-build
+# only analyzes files it actually sees compiled, so leftover objects from
+# a prior build would be silently skipped. tests/ is deliberately left
+# out - the analyzer doesn't model __attribute__((cleanup)), which the
+# test harness uses for env-var restore (tests/test_fs_helpers.h), so it
+# reports false "leaks" there; `make asan-test`'s LeakSanitizer covers
+# the tests at runtime instead.
+scan:
+	@if command -v scan-build >/dev/null 2>&1; then \
+		$(MAKE) clean && scan-build --status-bugs $(MAKE) all tfm-gui; \
+	else \
+		echo "scan-build not installed, skipping."; \
+	fi
 
 # `make asan` builds the TUI with ASan+UBSan instead of the normal
 # optimized/plain build - run bin/tfm under it manually.
