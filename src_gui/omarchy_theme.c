@@ -1,5 +1,6 @@
 #include "omarchy_theme.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,9 +8,9 @@
 
 #include "tfm_common.h"
 
-/* Trims whitespace and strips one pair of surrounding quotes in-place
- * (colors.toml writes values like accent = "#f38d70"). */
-static char *trim_and_unquote(char *s)
+/* Trims leading/trailing whitespace (including the line's own "\n"/"\r")
+ * in place. */
+static char *trim(char *s)
 {
     while (*s == ' ' || *s == '\t') {
         s++;
@@ -19,13 +20,79 @@ static char *trim_and_unquote(char *s)
         end--;
     }
     *end = '\0';
-
-    size_t len = strlen(s);
-    if (len >= 2 && s[0] == '"' && s[len - 1] == '"') {
-        s[len - 1] = '\0';
-        s++;
-    }
     return s;
+}
+
+/* Parses the value half of a "key = value" line in place (colors.toml
+ * writes values like accent = "#f38d70"), dropping a trailing TOML
+ * "# comment". A quoted value is everything up to its closing quote, so
+ * the '#' of a hex color inside the quotes is never mistaken for a
+ * comment, and whatever follows the closing quote (a comment, or junk)
+ * is ignored. An unquoted value - not valid TOML, but tolerated for a
+ * hand-edited file - ends at the first '#' preceded by whitespace, so
+ * a bare "accent = #f38d70" still keeps its leading '#'.
+ *
+ * The previous version trimmed trailing whitespace and only then checked
+ * "ends with a quote", so accent = "#f38d70" # comment kept the quotes
+ * AND the comment - and that whole string went verbatim into the
+ * @define-color CSS, which GTK then rejected wholesale, silently
+ * dropping the entire theme (CR4-M5). An unterminated quote returns "",
+ * i.e. "no usable value". */
+static char *parse_value(char *s)
+{
+    s = trim(s);
+    if (*s == '"') {
+        s++;
+        char *close = strchr(s, '"');
+        if (close == NULL) {
+            return s + strlen(s);
+        }
+        *close = '\0';
+        return s;
+    }
+
+    /* p > s guards the p[-1] lookbehind. */
+    for (char *p = s; *p != '\0'; p++) {
+        if (p > s && *p == '#' && (p[-1] == ' ' || p[-1] == '\t')) {
+            *p = '\0';
+            break;
+        }
+    }
+    return trim(s);
+}
+
+/* Colors from colors.toml are spliced verbatim into CSS (see
+ * gui_main.c's apply_omarchy_theme()), so anything other than a plain
+ * "#rgb"/"#rrggbb" hex color - the same two forms contrasting_fg_for()
+ * understands - is rejected here instead of being handed to GTK. A value
+ * that isn't a color (a typo, a stray ";", a CSS fragment) would
+ * otherwise make gtk_css_provider_load_from_string() discard the whole
+ * theme, not just that one color. */
+static int is_hex_color(const char *s)
+{
+    size_t len = strlen(s);
+    if (s[0] != '#' || (len != 4 && len != 7)) {
+        return 0;
+    }
+    for (size_t i = 1; i < len; i++) {
+        if (!isxdigit((unsigned char)s[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Copies value into a color field only if it's a valid hex color;
+ * otherwise leaves the field empty so the caller's libadwaita-default
+ * fallback for that color applies. Returns 1 if the value was stored. */
+static int store_color(char *field, size_t field_size, const char *value)
+{
+    if (!is_hex_color(value)) {
+        field[0] = '\0';
+        return 0;
+    }
+    snprintf(field, field_size, "%s", value);
+    return 1;
 }
 
 int omarchy_theme_load(OmarchyThemeColors *out)
@@ -68,22 +135,24 @@ int omarchy_theme_load(OmarchyThemeColors *out)
 
         char key_buf[sizeof(line)];
         snprintf(key_buf, sizeof(key_buf), "%s", line);
-        char *key = trim_and_unquote(key_buf);
-        char *value = trim_and_unquote(eq + 1);
+        char *key = trim(key_buf);
+        char *value = parse_value(eq + 1);
 
         if (strcmp(key, "mode") == 0) {
             out->is_dark = (strcmp(value, "dark") == 0);
         } else if (strcmp(key, "accent") == 0) {
-            snprintf(out->accent, sizeof(out->accent), "%s", value);
-            found_accent = 1;
+            /* An invalid accent counts as "not found": it's the one color
+             * the whole theme hinges on (see the header), so the caller
+             * falls back to standard system theming instead. */
+            found_accent = store_color(out->accent, sizeof(out->accent), value);
         } else if (strcmp(key, "background") == 0) {
-            snprintf(out->background, sizeof(out->background), "%s", value);
+            store_color(out->background, sizeof(out->background), value);
         } else if (strcmp(key, "foreground") == 0) {
-            snprintf(out->foreground, sizeof(out->foreground), "%s", value);
+            store_color(out->foreground, sizeof(out->foreground), value);
         } else if (strcmp(key, "dark_background") == 0) {
-            snprintf(out->dark_background, sizeof(out->dark_background), "%s", value);
+            store_color(out->dark_background, sizeof(out->dark_background), value);
         } else if (strcmp(key, "selection") == 0) {
-            snprintf(out->selection, sizeof(out->selection), "%s", value);
+            store_color(out->selection, sizeof(out->selection), value);
         }
     }
 

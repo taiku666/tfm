@@ -187,6 +187,13 @@ $(TEST_BUILD_DIR)/test_panel: EXTRA_OBJS = $(BUILD_DIR)/panel.o $(BUILD_DIR)/scr
 $(TEST_BUILD_DIR)/test_panel: EXTRA_LDFLAGS = -Wl,--wrap=dir_list
 $(TEST_BUILD_DIR)/test_panel: $(BUILD_DIR)/panel.o $(BUILD_DIR)/screen.o $(BUILD_DIR)/input.o
 
+# omarchy_theme.c lives in the GUI tree but is plain libc (no GTK), so it
+# is compiled straight into its test binary from source rather than via
+# $(GUI_BUILD_DIR), whose objects are built with GTK's pkg-config flags -
+# the test then runs on machines (and CI) without GTK installed.
+$(TEST_BUILD_DIR)/test_omarchy_theme: EXTRA_OBJS = $(GUI_SRC_DIR)/omarchy_theme.c
+$(TEST_BUILD_DIR)/test_omarchy_theme: $(GUI_SRC_DIR)/omarchy_theme.c $(GUI_SRC_DIR)/omarchy_theme.h
+
 $(TEST_BUILD_DIR)/%: $(TEST_DIR)/%.c $(CORE_OBJS) | $(TEST_BUILD_DIR)
 	$(CC) $(ALL_CFLAGS) $(IFLAGS) $< $(CORE_OBJS) $(EXTRA_OBJS) $(EXTRA_LDFLAGS) -o $@
 
