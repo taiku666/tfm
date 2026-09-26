@@ -110,14 +110,9 @@ static int utf8_char_len(unsigned char lead)
     return 1;
 }
 
-/* Visible column count of a UTF-8 string (one column per codepoint,
- * counting each multi-byte character once rather than once per byte) -
- * used to center the subtitle. Currently unreachable in the same sense
- * as build_big_text()'s codepoint counting above (the only call site
- * passes a hardcoded ASCII subtitle), but a future non-ASCII subtitle
- * would otherwise be centered using its byte length instead of its
- * displayed width, shifting it off-center by one column per multi-byte
- * character. */
+/* Visible column count of a UTF-8 string (one column per codepoint, not
+ * per byte), for centering the subtitle - a byte count would push a
+ * non-ASCII subtitle off-center. */
 static int utf8_visual_width(const char *text)
 {
     int n = 0;
@@ -129,11 +124,8 @@ static int utf8_visual_width(const char *text)
 
 static int build_big_text(const char *text, char rows_out[FONT_H][MAX_BIG_TEXT])
 {
-    /* Count codepoints, not bytes: text[i] used to be indexed byte-by-byte,
-     * so a single multi-byte UTF-8 character (e.g. an umlaut) rendered as
-     * several dot-fallback glyphs instead of one. Currently unreachable
-     * (the only call site passes a hardcoded ASCII title), fixed so a
-     * future non-ASCII title renders one glyph per character. */
+    /* Count codepoints, not bytes, so a multi-byte UTF-8 character (e.g.
+     * an umlaut) renders as one glyph instead of several dot-fallbacks. */
     int n = 0;
     for (const char *p = text; *p != '\0'; n++) {
         p += utf8_char_len((unsigned char)*p);

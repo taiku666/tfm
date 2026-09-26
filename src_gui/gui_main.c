@@ -32,8 +32,7 @@
 #include "tfm_common.h"
 
 /* Fallback GTK monospace font size (points) used whenever the active
- * terminal's own configured size can't be determined - was previously
- * four separate literal 11.0s that had to be kept in sync by hand. */
+ * terminal's own configured size can't be determined. */
 #define GUI_DEFAULT_FONT_SIZE 11.0
 
 /* One entry in a panel's list (file/dir or ".." to go up). Wrapped as a
@@ -88,9 +87,7 @@ static int g_focused_panel = 0;
 static GtkWidget *g_shell_entry = NULL;
 static GtkWindow *g_window = NULL;
 
-/* Mirrors the TUI's own other_panel_of() (src/main.c) - was previously
- * four separate "g_panel[g_focused_panel == 0 ? 1 : 0]" sites here that
- * had to be kept in sync by hand. */
+/* Mirrors the TUI's app_other_panel() (src/main.c). */
 static GuiPanel *other_panel_of_focused(void)
 {
     return &g_panel[g_focused_panel == 0 ? 1 : 0];
@@ -131,14 +128,10 @@ static void focus_panel(int index)
 static void show_error_dialog(const char *title, const char *message);
 
 /* Holds an initial-load-failure message (see panel_load() below) until
- * the main window is actually presented. panel_load()'s initial-failure
- * branch runs from build_panel_widget(), which activate() calls before
- * gtk_window_present() - calling show_error_dialog() straight from there
- * was tried and hung the whole app: AdwAlertDialog's blocking nested
- * g_main_loop_run() never returns because the dialog's parent window
- * (g_window) isn't mapped yet, so the dialog itself never becomes visible
- * to be answered. Sized for two independent messages (one per panel; see
- * the g_idle_add() flush in activate()). */
+ * the main window is presented. panel_load() first runs before
+ * gtk_window_present(), and a blocking AdwAlertDialog parented to an
+ * unmapped window never becomes visible, hanging the app in its nested
+ * main loop. One slot per panel; flushed via g_idle_add() in activate(). */
 static char g_pending_panel_load_error[2][PATH_MAX * 2 + 64];
 
 /* Same "defer until the window is mapped" reasoning as
@@ -147,21 +140,13 @@ static char g_pending_panel_load_error[2][PATH_MAX * 2 + 64];
  * there is no window at all yet to parent a blocking dialog to. */
 static char g_pending_config_load_error[PATH_MAX + 64];
 
-/* Reloads panel with path. On a reload failure (panel already has a
- * valid path/listing), the old path/contents are left unchanged - same
- * fallback contract as the TUI's panel_reload(), for a transient error
- * like a flaky mount. On an *initial*-load failure (panel->path is still
- * empty, i.e. no valid state exists to fall back to), silently leaving
- * it empty would misdirect every subsequent path_join(panel->path, name)
- * to "/name" (filesystem root) with no indication anything went wrong,
- * and on exit on_shutdown() would persist that empty path into tfm.ini -
- * so this case instead records an error message (see
- * g_pending_panel_load_error above) and falls back once to $HOME (or "/"
- * as a last resort). panel_index selects which of the two panels' pending-
- * message slots to use; it's only consulted on this initial-failure path
- * (panel_load()'s only other caller with an unset panel->path). Returns
- * 1 if panel now shows path (or, on the initial-load case, the $HOME/"/"
- * fallback), 0 if nothing was loaded and panel is unchanged. */
+/* Loads path into panel. A failed reload keeps the old listing, like the
+ * TUI's panel_reload(). A failed *initial* load (panel->path still empty)
+ * falls back to $HOME, then "/", and queues an error in
+ * g_pending_panel_load_error[panel_index]: an empty path would silently
+ * turn every path_join(panel->path, name) into "/name" and be persisted
+ * into tfm.ini on exit. Returns 1 if panel now shows path (or the
+ * fallback), 0 if panel is unchanged. */
 static int panel_load_indexed(GuiPanel *panel, const char *path, int panel_index)
 {
     DirEntryInfo *entries = NULL;
@@ -187,12 +172,10 @@ static int panel_load_indexed(GuiPanel *panel, const char *path, int panel_index
         path = fallback;
     }
 
-    /* Remember the currently selected item's name (if any) before the
-     * listing is rebuilt below - GtkSingleSelection has no memory of a
-     * specific item across a wholesale g_list_store replacement, so a
-     * reload (e.g. after F5 Copy, or a shell command that happened to
-     * touch this directory) previously always reset the selection back
-     * to index 0, losing the user's place in a long listing. */
+    /* Remember the selected item's name before rebuilding the listing:
+     * GtkSingleSelection forgets the item across a wholesale store
+     * replacement, so a reload would otherwise throw the user back to the
+     * top of a long listing. */
     char selected_name[256] = "";
     GtkSelectionModel *old_model = gtk_list_view_get_model(GTK_LIST_VIEW(panel->list_view));
     if (old_model != NULL) {
@@ -218,11 +201,8 @@ static int panel_load_indexed(GuiPanel *panel, const char *path, int panel_index
     }
     dir_list_free(entries);
 
-    /* Same model as old_model above (g_list_store_remove_all()/append()
-     * mutate the store in place rather than replacing the selection
-     * model) - re-selecting by name, or falling back to the top entry if
-     * the previously selected one is gone (e.g. it was just deleted or
-     * moved away). */
+    /* old_model is still valid: remove_all()/append() mutate the store in
+     * place. Re-select by name, or the top entry if that item is gone. */
     if (old_model != NULL && count > 0) {
         guint index_to_select = restore_found ? restore_index : 0;
         gtk_single_selection_set_selected(GTK_SINGLE_SELECTION(old_model), index_to_select);
@@ -231,10 +211,8 @@ static int panel_load_indexed(GuiPanel *panel, const char *path, int panel_index
         gtk_list_view_scroll_to(GTK_LIST_VIEW(panel->list_view), index_to_select, GTK_LIST_SCROLL_NONE, NULL);
     }
 
-    /* Callers may pass panel->path itself as path (e.g. to reload the
-     * same path after a shell command) - snprintf with overlapping
-     * source/dest is UB and has actually corrupted the path in this exact
-     * case (empty path label). Nothing to copy when they're equal anyway. */
+    /* Callers may pass panel->path itself as path (a plain reload), and
+     * snprintf with overlapping source/dest is UB. */
     if (path != panel->path) {
         snprintf(panel->path, sizeof(panel->path), "%s", path);
     }
@@ -315,11 +293,8 @@ static Config g_cfg;
 /* Rough brightness estimate (Rec. 601 luma) to pick a readable
  * foreground (black/white) for an accent color - Omarchy themes only
  * supply the accent color itself, not a matching contrast color.
- * Accepts both "#rrggbb" (every real Omarchy theme colors.toml uses
- * this) and the shorter CSS-style "#rgb" shorthand (each nibble
- * duplicated, e.g. "#f80" -> "#ff8800") - a hand-edited colors.toml
- * using the shorthand used to always fall back to white regardless of
- * the color's actual brightness. */
+ * Accepts "#rrggbb" and the CSS "#rgb" shorthand a hand-edited
+ * colors.toml may use. */
 static const char *contrasting_fg_for(const char *hex_color)
 {
     unsigned int r, g, b;
@@ -349,14 +324,10 @@ static const char *contrasting_fg_for(const char *hex_color)
  * was found (e.g. outside Omarchy) - both cases just do nothing further. */
 static void apply_omarchy_theme(void)
 {
-    /* Single decision point instead of three separate early-returns
-     * partially applying state: gui_theme=="system", a failed
-     * omarchy_theme_load(), and display==NULL now all fall into the same
-     * "revert to system default" branch below, instead of each one
-     * skipping the color-scheme reset and CSS-provider removal
-     * differently. Without this, toggling gui_theme from omarchy to
-     * system (or the active Omarchy theme disappearing) via the live
-     * SIGUSR1 reload never visually reverted. */
+    /* Every reason not to apply (gui_theme=="system", no Omarchy theme,
+     * no display) takes the same revert-to-system branch below, so a live
+     * SIGUSR1 reload from omarchy to system actually reverts the color
+     * scheme and removes the CSS provider. */
     int use_omarchy = strcasecmp(g_cfg.gui_theme, "system") != 0;
     GdkDisplay *display = gdk_display_get_default();
     OmarchyThemeColors colors;
@@ -415,15 +386,11 @@ static void apply_omarchy_theme(void)
              background, foreground, header_bg, foreground, header_bg, foreground, header_bg,
              foreground, background, foreground, header_bg, foreground, foreground, selection);
 
-    /* Match the panel border's corner radius to Hyprland's window rounding
-     * (only reached when gui_theme=="omarchy" is active).
-     *
-     * Deliberately a "border", not a filled background+padding: with a
-     * filled box, padding must scale with the radius or the square content
-     * corner clips the rounded arc (padding would need to be >=
-     * radius/sqrt(2), i.e. ~14px at radius=18px - much chunkier than
-     * wanted). A border traces the box's own outline regardless of content
-     * shape, so it stays a clean 2px independent of the radius. */
+    /* Match the panel border's corner radius to Hyprland's window
+     * rounding. A border rather than a filled background: a filled box
+     * needs padding >= radius/sqrt(2) (~14px at radius 18) or the square
+     * content corner clips the arc, while a border stays 2px at any
+     * radius. */
     int corner_radius = omarchy_hypr_corner_rounding();
     size_t used = strlen(css);
     snprintf(css + used, sizeof(css) - used,
@@ -431,14 +398,10 @@ static void apply_omarchy_theme(void)
              "padding: 3px; }\n",
              corner_radius > 0 ? corner_radius : 0);
 
-    /* Reload the existing provider's content in place rather than
-     * destroying and recreating it (remove-from-display, unref, new
-     * provider, add-to-display) on every theme-reload/SIGUSR1 call -
-     * GtkCssProvider supports being re-loaded, and staying attached to the
-     * display the whole time avoids a visible flash of unstyled content
-     * between remove and re-add. Only actually needed the first time (or
-     * after apply_omarchy_theme() tore it down via the !can_apply branch
-     * above). */
+    /* Reload the existing provider in place rather than recreating it on
+     * every SIGUSR1: staying attached to the display avoids a flash of
+     * unstyled content between remove and re-add. Created only the first
+     * time, or after the revert branch above tore it down. */
     if (g_theme_css_provider == NULL) {
         g_theme_css_provider = gtk_css_provider_new();
         gtk_style_context_add_provider_for_display(display, GTK_STYLE_PROVIDER(g_theme_css_provider),
@@ -636,14 +599,11 @@ static void on_shell_entry_activate(GtkEntry *entry, gpointer user_data)
     GuiPanel *active = &g_panel[g_focused_panel];
 
     if (gui_is_cd_command(command)) {
-        /* Resolved into a scratch copy, not active->path itself - same
-         * reasoning as the TUI's panel_change_dir() (CR4-M4): builtin_cd()
-         * rewrites the buffer it's given, and panel_load() keeps the old
-         * listing on failure, so resolving in place meant a directory that
-         * passed builtin_cd()'s opendir() probe but then failed to list
-         * left the path label showing the new path over the old listing,
-         * and on_shutdown() persisted that never-entered path. panel_load()
-         * only writes panel->path once the listing has actually loaded. */
+        /* Resolved into a scratch copy, not active->path, as in the TUI's
+         * panel_change_dir(): builtin_cd() rewrites its buffer, and a
+         * directory that then fails to list must not leave the new path
+         * over the old listing (and get persisted on exit). panel_load()
+         * only writes panel->path once the listing has loaded. */
         char new_path[PATH_MAX];
         char error_msg[128];
         snprintf(new_path, sizeof(new_path), "%s", active->path);
@@ -659,18 +619,11 @@ static void on_shell_entry_activate(GtkEntry *entry, gpointer user_data)
          * failure, so it's the cost of never showing a path that wasn't
          * actually entered. */
     } else {
-        /* shell_execute() waits via a single blocking waitpid() with no
-         * event pumping (pump == NULL) - tfm-gui is single-threaded, so
-         * that freezes the whole window ("Not Responding") for the
-         * command's entire duration. Use shell_execute_cb() with
-         * gui_pump_main_context() instead, exactly like editor_open_cb()
-         * already does for $EDITOR launches. gui_modal_enter()/leave()
-         * bracket the pumped wait so re-entrant F5-F8/F10/Tab are blocked
-         * while a command is running, same as every other pumping call in
-         * this file (fileops progress, editor launches) - without it, a
-         * long-running "sleep 5" or "git clone" in the shell bar would let
-         * F8 delete fire on the active panel out from under the still-
-         * running command. */
+        /* Pump the main context while waiting (shell_execute_cb() with
+         * gui_pump_main_context(), like editor launches): a plain blocking
+         * waitpid() would freeze the single-threaded window for the whole
+         * command. The modal bracket blocks F5-F8/F10/Tab meanwhile, so
+         * e.g. F8 can't delete files out from under a running command. */
         gui_modal_enter();
         int exit_code = shell_execute_cb(command, active->path, gui_pump_main_context, NULL);
         gui_modal_leave();
@@ -780,10 +733,9 @@ typedef struct {
 /* Builds/shows an AdwAlertDialog with arbitrary responses and blocks
  * until answered - shared base for show_error_dialog/confirm_dialog/
  * gui_fileop_on_error/gui_fileop_on_overwrite. message is never
- * interpreted as Pango markup (it may contain a filename/shell command
- * from the filesystem or user input - &/</> in it would otherwise be
- * misparsed as markup). Returns the chosen response ID (caller frees
- * with g_free()), or NULL on error. */
+ * interpreted as Pango markup, since it may contain filenames or shell
+ * commands with &/</> in them. Returns the chosen response ID (caller
+ * frees with g_free()), or NULL on error. */
 static char *show_alert_dialog(const char *title, const char *message,
                                 const DialogResponse *responses, size_t response_count,
                                 const char *default_response, const char *close_response)
@@ -831,13 +783,10 @@ static gboolean confirm_dialog(const char *title, const char *message, const cha
 /* Text input dialog (F6 Rename, F7 New folder). Returns the entered text
  * (caller frees with g_free()), or NULL on cancel.
  *
- * AdwAlertDialog works well for plain button dialogs, but its async
- * choose()/choose_finish() can't be cleanly triggered from an embedded
- * GtkEntry's Enter key (neither marking the default response nor manually
- * emitting "response" actually closed the dialog - Enter just fell
- * through to the close-response "Cancel"). So this is a simple hand-built
- * AdwDialog with two real buttons, where Enter in the entry triggers the
- * same handler as the OK button. */
+ * A hand-built AdwDialog rather than AdwAlertDialog: an embedded
+ * GtkEntry's Enter can't cleanly complete AdwAlertDialog's async choose()
+ * (it falls through to the close response, Cancel). Here Enter in the
+ * entry triggers the same handler as the OK button. */
 typedef struct {
     GMainLoop *loop;
     AdwDialog *dialog;
@@ -927,16 +876,11 @@ static char *prompt_text_dialog(const char *heading, const char *initial_text)
 /* fileops.c is UI-independent (see fileops.h) and calls these callbacks
  * on errors/conflicts - the GUI counterpart to tui_fileop_callbacks.
  *
- * Dialog default-response contract (Enter key / close-attempt), spelled
- * out explicitly so a future edit doesn't accidentally flip one of these
- * toward something destructive:
+ * Default responses (Enter / close) - none may be destructive:
  *   - error dialog (this function): Enter -> Retry, close -> Abort.
  *   - overwrite dialog (gui_fileop_on_overwrite): Enter -> Skip,
  *     close -> Abort.
- *   - delete confirmation (action_delete): close -> Cancel (see its own
- *     show_alert_dialog call for the Enter default).
- * None of these default to the destructive choice (Overwrite/Delete) on
- * a stray Enter or an accidental window close. */
+ *   - delete confirmation (action_delete): close -> Cancel. */
 static FileOpChoice gui_fileop_on_error(void *ctx, const char *title, const char *message)
 {
     (void)ctx;
@@ -1106,12 +1050,10 @@ static void action_move(void)
                 struct stat existing_st;
                 int confirmed = 1;
                 if (!is_safe_path_component(new_name)) {
-                    /* Without this, a typed name containing '/' (e.g.
-                     * "../../important") silently renames the file
-                     * OUTSIDE the current directory via the bare
-                     * rename() below, with none of fileops_move()'s
-                     * safety checks - "Rename" should never leave the
-                     * current directory. */
+                    /* A name containing '/' (e.g. "../../important")
+                     * would otherwise rename the file OUTSIDE the
+                     * current directory via the bare rename() below,
+                     * with none of fileops_move()'s safety checks. */
                     show_error_dialog("Error", "Name cannot contain '/' or be '.'/'..'");
                     confirmed = 0;
                 } else if (!path_join(old_path, sizeof(old_path), active->path, item->name) ||
@@ -1236,11 +1178,9 @@ static void action_delete_permanent(void)
 }
 
 /* Undo: restores the single most-recently-trashed item (see
- * fileops_restore_last_trashed()) - not a general undo of copy/move,
- * and not a trash browser; only ever the most recent delete. Reloads
- * both panels unconditionally since the restored item's original
- * directory may be either one, or neither (if the user has since
- * navigated away). */
+ * fileops_restore_last_trashed()) - not a general undo of copy/move.
+ * Reloads both panels since the restored item's directory may be either
+ * one, or neither. */
 static void action_undo(void)
 {
     char restored_path[PATH_MAX] = "";
@@ -1386,10 +1326,8 @@ static int is_foot_the_active_terminal(void)
     if (config_home != NULL && config_home[0] != '\0') {
         dirs[ndirs++] = config_home;
     } else if (home != NULL) {
-        /* Checked explicitly (matching omarchy_theme.c's CR4-M21 fix,
-         * missed here when that one was applied): an unchecked
-         * snprintf() truncating a very long $HOME would silently search
-         * a shorter, unrelated directory instead of failing outright. */
+        /* A truncated path from a very long $HOME would silently search
+         * a shorter, unrelated directory instead of failing. */
         if ((size_t)snprintf(dir_buf, sizeof(dir_buf), "%s/.config", home) < sizeof(dir_buf)) {
             dirs[ndirs++] = dir_buf;
         }
@@ -1430,13 +1368,10 @@ static int is_foot_the_active_terminal(void)
 
 /* Reads the font size configured in foot from "font=<Name>:size=<N>" in
  * ~/.config/foot/foot.ini, so tfm-gui starts at the same size as the
- * terminal UI - but only when foot is actually the user's active default
- * terminal (see is_foot_the_active_terminal()): tfm-gui only knows how to
- * parse foot's config format, and blindly trusting foot.ini regardless of
- * which terminal is actually configured would silently apply the wrong
- * terminal's font size (e.g. an alacritty/kitty/ghostty user who happens
- * to still have a stale/default foot.ini lying around). Returns a
- * sensible default on error/missing value/non-foot terminal. */
+ * terminal UI - but only when foot is the active default terminal (see
+ * is_foot_the_active_terminal()), since a stale foot.ini left behind by
+ * an alacritty/kitty/ghostty user would otherwise apply the wrong size.
+ * Returns GUI_DEFAULT_FONT_SIZE on error/missing value/non-foot terminal. */
 static double read_terminal_font_size(void)
 {
     if (!is_foot_the_active_terminal()) {
@@ -1618,31 +1553,21 @@ static gboolean on_window_key_pressed(GtkEventControllerKey *controller, guint k
 }
 
 /* g_modal_depth only guards the window's key controller, not the window
- * close itself. A compositor/WM-side close (SUPER+Q, CSD close button)
- * sends xdg_toplevel "close" directly to the surface, bypassing any
- * AdwDialog grab. Without this handler GTK would destroy the window
- * mid-operation (a Copy/Move/Delete pumps the main context via
- * g_main_context_iteration(), so the close event is actually delivered
- * while it's running) or while a nested GMainLoop waits on a dialog
- * response - leaving dangling callbacks/use-after-free on destroyed
- * widgets. */
+ * close itself. A compositor-side close (SUPER+Q, CSD close button)
+ * bypasses any AdwDialog grab and is delivered while a fileop pumps the
+ * main context or a nested GMainLoop waits on a dialog - destroying the
+ * window then would leave callbacks running on freed widgets. */
 static gboolean on_window_close_request(GtkWindow *window, gpointer user_data)
 {
     (void)window;
     (void)user_data;
 
     if (g_modal_depth > 0) {
-        /* show_error_dialog() itself pumps a nested main loop (see
-         * run_alert_dialog_blocking()), which keeps GTK's event dispatch
-         * running - a close-button click (or SUPER+Q) arriving again
-         * while THIS "Please wait" dialog is still up would re-enter this
-         * handler (g_modal_depth is still > 0, now incremented further by
-         * the dialog itself) and show a second "Please wait" dialog on
-         * top of the first, and so on for every repeated click. Guard
-         * with a dedicated static flag, separate from g_modal_depth
-         * (which must stay > 0 the whole time for this branch to keep
-         * firing at all), so a re-entrant call just refuses the close
-         * without stacking another dialog. */
+        /* show_error_dialog() pumps a nested main loop, so a repeated close
+         * click re-enters this handler while "Please wait" is still up.
+         * A dedicated flag (g_modal_depth stays > 0 throughout, so it
+         * can't serve) refuses those re-entrant closes instead of
+         * stacking another dialog per click. */
         static int showing_wait_dialog = 0;
         if (!showing_wait_dialog) {
             showing_wait_dialog = 1;
@@ -1658,15 +1583,10 @@ static gboolean on_window_close_request(GtkWindow *window, gpointer user_data)
 }
 
 /* Flushes g_pending_panel_load_error (see panel_load_indexed()) once the
- * main window is actually mapped - scheduled via g_idle_add() rather than
- * called directly after gtk_window_present() below, since present() only
- * requests mapping; showing a blocking modal immediately afterward, still
- * synchronously within activate(), hit the same hang this whole mechanism
- * exists to avoid (see panel_load_indexed()'s doc comment) because the
- * window hadn't actually been realized by the compositor yet. Letting the
- * main loop run at least one iteration first (idle callbacks fire on the
- * next iteration) reliably gets a real mapped window before the dialog
- * needs one. */
+ * main window is actually mapped. Scheduled via g_idle_add() rather than
+ * called right after gtk_window_present(): present() only requests
+ * mapping, so a blocking dialog shown synchronously in activate() hits
+ * the unmapped-parent hang described at g_pending_panel_load_error. */
 static gboolean flush_pending_panel_load_errors(gpointer user_data)
 {
     (void)user_data;
@@ -1759,13 +1679,10 @@ static void activate(GtkApplication *app, gpointer user_data)
 }
 
 /* Unlike the terminal UI, the GUI has no "actual" sentinel for left_path
- * - both panel paths are saved directly from current state. A panel's
- * path can still be empty here if its initial load AND panel_load()'s
- * own $HOME/"/" fallback both failed (see panel_load()) - in that
- * unrecoverable case, leave g_cfg's already-loaded value for that field
- * untouched instead of overwriting it with "", so the original (if
- * still-broken) configured path survives in tfm.ini for the user to fix,
- * rather than being silently replaced by an empty one. */
+ * - both panel paths are saved directly from current state. A path is
+ * still empty if its initial load and the $HOME/"/" fallback both
+ * failed; then the configured value is kept, so the broken path survives
+ * in tfm.ini for the user to fix instead of being replaced by "". */
 static void on_shutdown(GApplication *app, gpointer user_data)
 {
     (void)app;

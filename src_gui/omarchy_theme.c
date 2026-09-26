@@ -23,21 +23,12 @@ static char *trim(char *s)
     return s;
 }
 
-/* Parses the value half of a "key = value" line in place (colors.toml
- * writes values like accent = "#f38d70"), dropping a trailing TOML
- * "# comment". A quoted value is everything up to its closing quote, so
- * the '#' of a hex color inside the quotes is never mistaken for a
- * comment, and whatever follows the closing quote (a comment, or junk)
- * is ignored. An unquoted value - not valid TOML, but tolerated for a
- * hand-edited file - ends at the first '#' preceded by whitespace, so
- * a bare "accent = #f38d70" still keeps its leading '#'.
- *
- * The previous version trimmed trailing whitespace and only then checked
- * "ends with a quote", so accent = "#f38d70" # comment kept the quotes
- * AND the comment - and that whole string went verbatim into the
- * @define-color CSS, which GTK then rejected wholesale, silently
- * dropping the entire theme (CR4-M5). An unterminated quote returns "",
- * i.e. "no usable value". */
+/* Parses the value half of a "key = value" line in place, dropping a
+ * trailing TOML "# comment". A quoted value ends at its closing quote, so
+ * a hex color's '#' inside it is never taken for a comment. An unquoted
+ * value (tolerated for hand-edited files) ends at the first '#' preceded
+ * by whitespace, so a bare "#f38d70" keeps its '#'. An unterminated
+ * quote returns "" (no usable value). */
 static char *parse_value(char *s)
 {
     s = trim(s);
@@ -61,13 +52,9 @@ static char *parse_value(char *s)
     return trim(s);
 }
 
-/* Colors from colors.toml are spliced verbatim into CSS (see
- * gui_main.c's apply_omarchy_theme()), so anything other than a plain
- * "#rgb"/"#rrggbb" hex color - the same two forms contrasting_fg_for()
- * understands - is rejected here instead of being handed to GTK. A value
- * that isn't a color (a typo, a stray ";", a CSS fragment) would
- * otherwise make gtk_css_provider_load_from_string() discard the whole
- * theme, not just that one color. */
+/* Colors are spliced verbatim into CSS (gui_main.c's
+ * apply_omarchy_theme()), so only plain "#rgb"/"#rrggbb" is accepted: any
+ * other value makes GTK discard the whole theme, not just that color. */
 static int is_hex_color(const char *s)
 {
     size_t len = strlen(s);

@@ -28,11 +28,9 @@ typedef struct {
 void config_set_defaults(Config *cfg);
 
 /* Loads config from ~/.tfm/tfm.ini, or defaults if the file doesn't exist.
- * error_msg/error_msg_size are optional (pass NULL/0 to ignore) - on
- * return, error_msg[0] is '\0' if the file was missing (the normal
- * first-run case, silently using defaults) or loaded successfully, or a
- * human-readable reason (naming the real syscall failure, e.g.
- * "Cannot open ...: Permission denied") if an existing file could not be
+ * error_msg is optional (NULL/0 to ignore): on return it is "" if the file
+ * loaded or was missing (the normal first run), or a reason such as
+ * "Cannot open ...: Permission denied" if an existing file couldn't be
  * read. */
 void config_load(Config *cfg, char *error_msg, size_t error_msg_size);
 

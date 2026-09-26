@@ -15,16 +15,10 @@
 #include "tfm_common.h"
 
 /* Case-insensitive, locale-aware comparison of two UTF-8 filenames.
- * strcasecmp() alone only ever does per-byte ASCII folding - even with
- * setlocale(LC_ALL, "") called at startup (see main()), it doesn't
- * decode multibyte UTF-8 sequences at all, so accented characters never
- * fold ("Übung" and "übung" compare as unrelated byte sequences) and
- * don't collate the way the active locale's alphabet expects. Converts
- * to wide characters, case-folds each one with towlower(), then collates
- * with wcscoll() (locale-aware ordering, not just codepoint value).
- * Falls back to plain strcasecmp() if the multibyte conversion fails
- * (e.g. invalid UTF-8, or no locale support installed) rather than
- * comparing partially-converted, garbage wide strings. */
+ * strcasecmp() only folds ASCII bytes, so "Übung" and "übung" would
+ * compare as unrelated; this folds wide characters with towlower() and
+ * collates with wcscoll(). Falls back to strcasecmp() if the multibyte
+ * conversion fails (invalid UTF-8, no locale support). */
 static int compare_names_locale_aware(const char *a, const char *b)
 {
     wchar_t wa[300];
@@ -98,12 +92,10 @@ int dir_list(const char *path, DirEntryInfo **out_entries, size_t *out_count)
     }
 
     struct dirent *entry;
-    /* errno reset right before every readdir() call (not just once
-     * before the loop): the loop body's own stat() call for DT_UNKNOWN/
-     * DT_LNK entries can fail (e.g. a dangling symlink) and leave errno
-     * set without that being a real dir_list() failure - resetting only
-     * once would let that stale errno be misattributed to readdir()'s
-     * final, successful EOF return. */
+    /* errno is reset before every readdir(), not once before the loop:
+     * the body's stat() can fail harmlessly (e.g. a dangling symlink),
+     * and its stale errno would be mistaken for a readdir() error at
+     * EOF. */
     while ((errno = 0, entry = readdir(dp)) != NULL) {
         /* Skip "." but keep ".." visible for navigating up. */
         if (strcmp(entry->d_name, ".") == 0) {

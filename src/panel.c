@@ -94,17 +94,12 @@ int panel_reload(Panel *panel)
 
     if (dir_list(panel->path, &new_entries, &new_count) != 0) {
         /* A failed reload (dir deleted/unmounted, permissions revoked...)
-         * must not destroy a still-valid existing listing. If there are
-         * no entries at all yet (e.g. an invalid path saved in tfm.ini),
-         * synthesize a ".." entry so the panel isn't a dead end.
-         *
-         * scroll_offset/selected_index are deliberately left alone when
-         * the old listing is kept: they still index that same, unchanged
-         * listing, so they stay valid - and resetting them used to throw
-         * the user back to the top of a long listing for nothing more
-         * than a transient reload error (CR4-M4b). Only the synthesized
-         * one-entry fallback needs them reset, since it replaces an
-         * empty listing whose indices meant nothing. */
+         * must not destroy a still-valid existing listing, and keeps
+         * scroll_offset/selected_index too - they still index that same
+         * listing, and a transient error shouldn't throw the user back to
+         * the top. With no entries at all yet (e.g. an invalid path saved
+         * in tfm.ini), synthesize a ".." entry so the panel isn't a dead
+         * end. */
         int saved_errno = errno;
         if (panel->entries == NULL) {
             DirEntryInfo *fallback = malloc(sizeof(DirEntryInfo));
@@ -134,15 +129,11 @@ int panel_reload(Panel *panel)
 int panel_change_dir(Panel *panel, const char *command, char *error_msg, size_t error_msg_size)
 {
     /* Resolved into a scratch copy, not panel->path itself: builtin_cd()
-     * rewrites the buffer it's given on success, and doing that to
-     * panel->path directly (as both call sites in main.c used to) meant a
-     * dir_list() failure right afterwards - builtin_cd()'s own opendir()
-     * probe passed, but the directory vanished/lost its permissions/hit
-     * an I/O error in between - left panel_draw() showing the NEW path
-     * above the OLD listing with no error at all, and main.c then
-     * persisted that never-actually-entered path into tfm.ini on quit
-     * (CR4-M4). Now the path and listing are only ever swapped together,
-     * after both have succeeded. */
+     * rewrites its buffer on success, and a dir_list() failure right
+     * afterwards (directory vanished between builtin_cd()'s probe and the
+     * listing) would leave the new path shown above the old listing - and
+     * persisted into tfm.ini on quit. Path and listing are only swapped
+     * together, after both have succeeded. */
     char new_path[PATH_MAX];
     snprintf(new_path, sizeof(new_path), "%s", unsized(panel->path));
     if (!builtin_cd(new_path, command, error_msg, error_msg_size)) {

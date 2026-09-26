@@ -74,15 +74,10 @@ void input_enable_raw_mode(void)
         winch_action.sa_handler = handle_sigwinch;
         sigemptyset(&winch_action.sa_mask);
         winch_action.sa_flags = 0; /* no SA_RESTART: read() must be interrupted */
-        /* Return value deliberately not surfaced to the user here (unlike
-         * main.c's terminating-signal handlers): this runs after
-         * screen_enter_alt_screen(), so an stderr write would land as
-         * stray text in the alt-screen buffer, corrupting the display -
-         * worse than the failure itself, which essentially cannot happen
-         * for a fixed, valid signal number on Linux anyway. On the
-         * astronomically unlikely failure, resize events are simply never
-         * handled (the panel layout stays at its size at startup) - a
-         * silent degradation, but a survivable one. */
+        /* Failure deliberately not reported: this runs after
+         * screen_enter_alt_screen(), so an stderr write would corrupt the
+         * display. The (practically impossible) failure only means resizes
+         * are ignored, which is survivable. */
         (void)sigaction(SIGWINCH, &winch_action, NULL);
     }
 }
@@ -257,13 +252,10 @@ KeyEvent input_read_key(void)
     }
 
     /* Escape sequence: collect bytes one at a time with a short timeout
-     * between them (see read_seq_byte()) instead of a single non-
-     * blocking drain - that distinguishes a bare ESC (nothing more
-     * arrives within the timeout) from the start of a real multi-byte
-     * sequence whose later bytes haven't landed in the kernel buffer
-     * yet, without adding a perceptible delay to plain ESC. 32 bytes so
-     * a longer sequence this table doesn't recognize (e.g. an xterm
-     * modified key like ESC[1;5A, or ESC[27;5;65~) gets fully drained. */
+     * (see read_seq_byte()) instead of a single non-blocking drain, which
+     * tells a bare ESC apart from a sequence whose later bytes haven't
+     * arrived yet. 32 bytes so a longer unrecognized sequence (e.g.
+     * ESC[27;5;65~) gets fully drained. */
     char seq[32];
     int seq_len = 0;
 
@@ -294,24 +286,19 @@ KeyEvent input_read_key(void)
         return event;
     }
 
-    /* Shift+F8 (permanent-delete bypass for the trash feature) - xterm's
-     * modified-key encoding is "<code>;<modifier>~" (modifier 2 =
-     * Shift), distinct from the plain "[19~" F8 entry in
-     * ESC_SEQUENCES. Deliberately narrow (just this one combination,
-     * not a general modifier parser) since it's the only modified
-     * function key tfm currently binds anything to. */
+    /* Shift+F8 (permanent delete), xterm's "<code>;<modifier>~" encoding
+     * with modifier 2 = Shift. Matched directly rather than via a general
+     * modifier parser, since it's the only modified key tfm binds. */
     if (seq_len == 6 && memcmp(seq, "[19;2~", 6) == 0) {
         event.type = KEY_F8;
         event.shift = 1;
         return event;
     }
 
-    /* Unrecognized sequence: queue the collected bytes to be replayed as
-     * plain characters by the next input_read_key() call(s) instead of
-     * discarding them - a byte silently eaten here previously meant the
-     * following real keystroke could look like it started with garbage,
-     * or an unmatched Alt-chord's letter vanished entirely. This call
-     * still reports KEY_UNKNOWN for the sequence itself. */
+    /* Unrecognized sequence: report KEY_UNKNOWN, but queue the collected
+     * bytes to be replayed as plain characters by the next
+     * input_read_key() call(s) - discarding them would make e.g. an
+     * unmatched Alt-chord's letter vanish. */
     int queued = seq_len;
     if (queued > (int)sizeof(g_pending)) {
         queued = (int)sizeof(g_pending);

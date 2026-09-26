@@ -23,9 +23,8 @@
 #define CMD_BUFFER_SIZE 256
 #define CMD_PROMPT "$ "
 
-/* Shared size for the various short one-line messages built in this file
- * (synthetic "cd <name>" commands, popup/confirm text) - was previously
- * three separate literal 300s that had to be kept in sync by hand. */
+/* Shared size for the short one-line messages built in this file
+ * (synthetic "cd <name>" commands, popup/confirm text). */
 #define TUI_MSG_BUFFER_SIZE 300
 
 typedef enum {
@@ -116,15 +115,10 @@ static void redraw_ui(const App *app)
     screen_draw_command_line(CMD_PROMPT, app->cmd_buffer);
 }
 
-/* Shared hide-draw-wait-show pattern for info/error popups, previously
- * duplicated at many call sites.
- *
- * Loops and redraws on resize instead of drawing once and calling
- * input_wait_any_key(): the latter silently consumes a SIGWINCH during
- * the wait without redrawing anything, so a resize while this popup is up
- * used to leave it on screen at its old, now wrong, size/position until
- * dismissed - unlike screen_prompt_buttons()/screen_prompt_text(), which
- * already redraw themselves on every resize. */
+/* Shows an info/error popup and waits for a key. Loops and redraws on
+ * resize instead of calling input_wait_any_key(), which consumes a
+ * SIGWINCH without redrawing and would leave the popup at its old
+ * size/position until dismissed. */
 static void tui_show_popup(const char *title, const char *message)
 {
     screen_hide_cursor();
@@ -267,15 +261,11 @@ static const FileOpCallbacks tui_fileop_callbacks = {
     .ctx = NULL,
 };
 
-/* Set by the terminating-signal handler below; checked at the top of the
- * main loop so shutdown goes through the normal exit path (atexit
- * handlers AND config_save()) instead of calling exit()/config_save()
- * directly from a signal handler, which isn't async-signal-safe
- * (config_save() calls fopen/fprintf/fclose). sig_atomic_t + volatile is
- * the one type POSIX guarantees is safe to write from a handler and read
- * from normal code. No SA_RESTART on these handlers, so the blocking
- * read() in input_read_key() is interrupted (EINTR) and control returns
- * to the main loop promptly instead of waiting for the next keypress. */
+/* Set by the terminating-signal handler and checked by the main loop, so
+ * shutdown goes through the normal exit path (atexit handlers and
+ * config_save()) - neither is async-signal-safe to call from the handler
+ * itself. No SA_RESTART, so the blocking read() in input_read_key() is
+ * interrupted (EINTR) and the loop sees the flag promptly. */
 static volatile sig_atomic_t g_shutdown_requested = 0;
 
 static void handle_terminating_signal(int signum)
@@ -291,23 +281,17 @@ static void install_terminating_signal_handlers(void)
     action.sa_handler = handle_terminating_signal;
     sigemptyset(&action.sa_mask);
     action.sa_flags = 0;
-    /* Return values checked (unlike before) and reported to stderr - safe
-     * to do here specifically because this runs before
-     * screen_enter_alt_screen()/input_enable_raw_mode() below, so stderr
-     * is still the normal, visible terminal output. These essentially
-     * cannot fail for fixed, valid signal numbers on Linux, but silently
-     * ignoring a failure here would mean a degraded graceful-shutdown
-     * path (g_shutdown_requested, config_save() on exit) with zero
-     * indication to the user that it happened. */
+    /* Failures go to stderr, which is still the visible terminal here
+     * (this runs before the alt screen and raw mode are entered). They
+     * are practically impossible, but would otherwise silently disable
+     * the graceful-shutdown path. */
     if (sigaction(SIGTERM, &action, NULL) != 0 || sigaction(SIGHUP, &action, NULL) != 0 ||
         sigaction(SIGQUIT, &action, NULL) != 0) {
         fprintf(stderr, "tfm: warning: failed to install a signal handler: %s\n", strerror(errno));
     }
     /* SIGINT: with ISIG cleared in raw mode (input.c), Ctrl-C arrives as
-     * ordinary KEY_CHAR data, not this signal - but `kill -INT <pid>`
-     * from outside the terminal still sends a real SIGINT, which
-     * previously bypassed all cleanup (stuck raw mode/alt-screen/hidden
-     * cursor). */
+     * ordinary KEY_CHAR data, but `kill -INT <pid>` still sends a real
+     * SIGINT, which would otherwise skip all terminal cleanup. */
     if (sigaction(SIGINT, &action, NULL) != 0) {
         fprintf(stderr, "tfm: warning: failed to install SIGINT handler: %s\n", strerror(errno));
     }

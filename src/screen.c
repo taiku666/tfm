@@ -178,10 +178,7 @@ static void move_cursor(int row, int col)
 }
 
 /* Draws one horizontal popup border edge (top or bottom) at row/col,
- * box_width columns wide - the same "corner + N horizontals + corner"
- * pattern was previously duplicated at four separate popup-drawing call
- * sites (screen_draw_popup, draw_popup_frame, screen_draw_progress_popup,
- * screen_prompt_buttons). */
+ * box_width columns wide, shared by all popup-drawing functions. */
 static void draw_popup_border_edge(int row, int col, int box_width, int is_top)
 {
     move_cursor(row, col);
@@ -625,12 +622,9 @@ void screen_draw_progress_popup(const char *title, const char *item, double perc
         inner_width = max_inner_width;
     }
 
-    /* PATH_MAX, not a smaller fixed size - item can be a full path up to
-     * PATH_MAX bytes; a smaller buffer would silently truncate it here,
-     * before the visual-width clipping below even runs (which correctly
-     * adds a "..." indicator, but only for its OWN clipping - a
-     * truncation at this snprintf() would have already lost bytes with
-     * no indicator at all). */
+    /* PATH_MAX, since item can be a full path: truncating here would lose
+     * bytes silently, before the visual-width clipping below gets to add
+     * its "..." indicator. */
     char item_display[PATH_MAX + 4];
     snprintf(item_display, sizeof(item_display), "%s", item);
     if (utf8_visual_width(item_display) > inner_width && inner_width > 3) {
@@ -648,16 +642,10 @@ void screen_draw_progress_popup(const char *title, const char *item, double perc
             col++;
         }
         char truncated[PATH_MAX + 4];
-        /* utf8_visual_width() above and this loop count codepoints the
-         * same way (1 per non-continuation-byte, per utf8_visual_width()'s
-         * own comment) - since the entry condition already guarantees
-         * item_display has strictly more than `keep` codepoints, this
-         * loop can never exhaust cut to 0 before col reaches keep, so
-         * "..." + item_display+cut always fits comfortably under
-         * PATH_MAX+4. GCC's -Wformat-truncation (at -O2 with
-         * _FORTIFY_SOURCE=2) can't see that cross-loop invariant and
-         * assumes the cut==0 worst case instead; unsized() (tfm_common.h)
-         * hides item_display's array bound from that analysis. */
+        /* item_display has more than `keep` codepoints (entry condition),
+         * so cut never reaches 0 and "..." + the tail always fits.
+         * GCC's -Wformat-truncation can't see that cross-loop invariant;
+         * unsized() (tfm_common.h) hides the array bound from it. */
         snprintf(truncated, sizeof(truncated), "...%s", unsized(item_display + cut));
         snprintf(item_display, sizeof(item_display), "%s", truncated);
     }
@@ -896,12 +884,8 @@ ScreenChoice screen_prompt_overwrite(const char *path)
 
 int screen_prompt_text(const char *title, char *buffer, size_t buffer_size)
 {
-    /* Sized to match the caller's own buffer instead of a fixed 256:
-     * previously any caller passing buffer_size > 256 (none currently do
-     * - entry names are capped at 255 bytes - but the contract allows
-     * it) would have a longer prefill silently truncated by this
-     * function's own internal buffer, independent of and smaller than
-     * what the caller actually asked for. */
+    /* Sized to the caller's buffer, not a fixed size, so a prefill of any
+     * length the caller allows is never truncated here. */
     size_t edit_capacity = buffer_size > 0 ? buffer_size : 1;
     char *edited = malloc(edit_capacity);
     if (edited == NULL) {

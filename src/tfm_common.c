@@ -73,15 +73,10 @@ int builtin_cd(char *current_dir, const char *command, char *error_msg, size_t e
 
     char resolved[PATH_MAX];
     if (realpath(raw_path, resolved) == NULL) {
-        /* Every realpath() failure used to collapse into the same
-         * generic "Directory not found", regardless of the real reason
-         * (ENOENT: doesn't exist; EACCES: a parent component isn't
-         * searchable; ENAMETOOLONG: a component too long; ELOOP: a
-         * symlink cycle) - strerror() distinguishes them for the user
-         * instead of always implying "just doesn't exist" for cases
-         * that are actually a permissions or path problem. Captured
-         * immediately after the failing call, before any other libc
-         * call (even snprintf() below) could clobber errno. */
+        /* strerror() tells the user why realpath() failed (missing,
+         * unsearchable parent, name too long, symlink loop) instead of a
+         * generic "not found". errno is captured before any other libc
+         * call (even snprintf() below) can clobber it. */
         int saved_errno = errno;
         if (error_msg != NULL) {
             snprintf(error_msg, error_msg_size, "Cannot cd to \"%s\": %s", raw_path,
@@ -139,15 +134,11 @@ size_t utf8_prev_char_len(const char *buf, size_t len)
     }
     size_t new_len = len - 1;
     size_t continuation_bytes = 0;
-    /* UTF-8 continuation bytes are 10xxxxxx (0x80-0xBF); skip back over
-     * any of those to reach the lead byte of the last codepoint. Capped
-     * at 3 continuation bytes (a well-formed codepoint is at most 4 bytes
-     * total) - without this cap, a buffer containing malformed UTF-8 (a
-     * long run of orphaned continuation bytes with no valid lead byte
-     * before them - not reachable via normal typing, only via a broken
-     * terminal/IME or already-corrupt input) would walk all the way back
-     * to index 0, and a single Backspace would delete the ENTIRE buffer
-     * instead of one character. */
+    /* Skip back over continuation bytes (10xxxxxx) to the lead byte of
+     * the last codepoint. Capped at 3, the most a well-formed codepoint
+     * has: on malformed input (a long run of orphaned continuation
+     * bytes) the walk would otherwise reach index 0, and one Backspace
+     * would delete the whole buffer. */
     while (new_len > 0 && continuation_bytes < 3 && ((unsigned char)buf[new_len] & 0xC0) == 0x80) {
         new_len--;
         continuation_bytes++;

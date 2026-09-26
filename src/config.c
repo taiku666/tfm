@@ -163,13 +163,9 @@ void config_load(Config *cfg, char *error_msg, size_t error_msg_size)
 
     FILE *fp = fopen(path, "r");
     if (fp == NULL) {
-        /* ENOENT is the ordinary first-run case (no config saved yet) -
-         * silently keep the defaults set above rather than alarming the
-         * user about a "missing" file that's expected not to exist yet.
-         * Any other failure (e.g. EACCES on a config directory some other
-         * process/tool mangled the permissions of) is real and worth
-         * surfacing, instead of the previous silent fall-back-to-defaults
-         * that looked identical to a successful load with no config file. */
+        /* ENOENT is the ordinary first-run case: keep the defaults silently.
+         * Any other failure (e.g. EACCES) is real and reported, so it
+         * doesn't look identical to a first run. */
         if (errno != ENOENT && error_msg != NULL) {
             snprintf(error_msg, error_msg_size, "Cannot open \"%s\": %s", path, strerror(errno));
         }
@@ -312,12 +308,9 @@ void config_save(const Config *cfg, char *error_msg, size_t error_msg_size)
         return;
     }
 
-    /* Escaped into a buffer sized for the largest field (left_path/
-     * right_path, PATH_MAX) - reused for every key since writes happen
-     * one at a time, sequentially. A value that doesn't fit even after
-     * escaping (only possible for the two PATH_MAX path fields, if every
-     * byte needed escaping) fails the whole save rather than writing a
-     * silently truncated line. */
+    /* Sized for the largest field (a PATH_MAX path) fully escaped, and
+     * reused for every key. A value that still doesn't fit fails the
+     * whole save rather than writing a truncated line. */
     char esc[PATH_MAX * 2 + 16];
     int ok = 1;
 
@@ -341,12 +334,9 @@ void config_save(const Config *cfg, char *error_msg, size_t error_msg_size)
 #undef WRITE_KV
 
     if (!ok && error_msg != NULL) {
-        /* A WRITE_KV failure is either escape_value() truncation (a
-         * PATH_MAX-sized value that doesn't even fit after "\\" escaping)
-         * or an fprintf() failure - errno isn't reliably set for the
-         * latter until the stream is actually flushed, so this can't
-         * always distinguish the two, but it's still strictly more
-         * information than the previous silent failure. */
+        /* Either escape_value() truncation or an fprintf() failure; errno
+         * isn't reliably set for the latter before a flush, so the two
+         * can't always be told apart. */
         snprintf(error_msg, error_msg_size, "Could not write config data (value too long or a write error)");
     }
 

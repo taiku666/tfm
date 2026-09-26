@@ -19,14 +19,11 @@
 #include "tfm_common.h"
 
 /* Ceiling on directory-tree recursion depth for compute_total_size(),
- * copy_recursive(), and delete_recursive(). All three recurse one stack
- * frame per directory level with no depth check, so a sufficiently deep
- * tree (rare, but not impossible - a deeply nested build cache, or a
- * maliciously/accidentally constructed tree) could exhaust the stack and
- * crash instead of failing cleanly. copy_recursive()'s frame alone holds
- * three PATH_MAX (4096-byte) buffers, so even a generous limit here still
- * leaves a comfortable margin below a real overflow on the default 8MB
- * stack. */
+ * copy_recursive(), and delete_recursive(), which recurse one stack frame
+ * per directory level - a pathologically deep tree would otherwise
+ * exhaust the stack and crash instead of failing cleanly.
+ * copy_recursive()'s frame holds three PATH_MAX buffers, so 200 still
+ * leaves a comfortable margin on the default 8MB stack. */
 #define MAX_RECURSION_DEPTH 200
 
 typedef struct {
@@ -70,21 +67,15 @@ static void report_progress(const FileOpCallbacks *cb, const char *title, const 
 }
 
 /* Computes the total size of path (recursively) so copy_recursive() can
- * show a percentage; this requires a full pre-pass before the actual
- * copy pass. report_progress() is called here too (once per directory
- * entered, not per file, to avoid flooding the callback): without it, a
- * large tree (e.g. a repo with node_modules) caused a long silent pause
- * before any visible progress, and in the GUI the window appeared frozen
- * because g_main_context_iteration() is only pumped inside on_progress
- * (see gui_fileop_on_progress), which wasn't called during this pass. */
+ * show a percentage. report_progress() is called once per directory
+ * entered: on a large tree this pre-pass is otherwise a long silent
+ * pause, and the GUI only pumps its main loop inside on_progress, so its
+ * window would appear frozen. */
 static long long compute_total_size_impl(const char *path, const FileOpCallbacks *cb, int depth)
 {
-    /* Same "just an estimate, fail soft" treatment as an opendir()
-     * failure below - a tree deep enough to hit this is already an edge
-     * case for a progress-percent pre-pass, not worth surfacing a dialog
-     * over. copy_recursive()/delete_recursive() (below) hit the real data
-     * they operate on, so THEY report this instead of silently
-     * undercounting. */
+    /* Fail soft, like an opendir() failure below: this only feeds a
+     * progress estimate. copy_recursive()/delete_recursive() touch real
+     * data, so they report the same condition instead. */
     if (depth > MAX_RECURSION_DEPTH) {
         return 0;
     }
@@ -198,28 +189,21 @@ static int copy_file(const char *src_path, const char *dest_path, CopyProgress *
             }
             return 0;
         }
-        /* Remove the existing entry. If it's a directory, unlink() would
-         * fail (EISDIR) and fall through to O_EXCL failing EEXIST,
-         * producing an infinite Retry loop with no indication of the real
-         * cause - route through remove_existing_for_overwrite() (shared
-         * with copy_recursive()'s type-mismatch handling) so a directory
-         * is removed recursively instead. For a plain file/symlink this
-         * still removes it by name (not following it): a subsequent
-         * fopen(dest_path, "wb") would follow a symlink and
-         * open/truncate its target instead - a different file than the
-         * one just confirmed. That + O_EXCL below close this TOCTOU
-         * window. */
+        /* Removed via remove_existing_for_overwrite() so a directory goes
+         * recursively (a plain unlink() would fail EISDIR and leave O_EXCL
+         * below failing EEXIST forever). A file or symlink is removed by
+         * name, not followed - together with O_EXCL below, that stops a
+         * symlink's target (a different file than the one just
+         * confirmed) from being truncated. */
         if (!remove_existing_for_overwrite(dest_path, &existing, cb)) {
             return 0;
         }
     }
 
-    /* Tracks whether dest_path was already (re)created in this call: a
-     * "Retry" after a write error should truncate/reuse the same file we
-     * just created (O_TRUNC), but the very first creation uses O_EXCL so
-     * open() fails if something appeared there in the race between the
-     * overwrite check above and here (e.g. a newly created symlink)
-     * instead of silently following it like fopen(..., "wb") would. */
+    /* Whether dest_path was already created in this call: a Retry reuses
+     * that file (O_TRUNC), but the first creation uses O_EXCL so it fails
+     * if something (e.g. a symlink) appeared there since the overwrite
+     * check above, instead of following it. */
     int dest_created = 0;
 
     for (;;) {
@@ -244,16 +228,11 @@ static int copy_file(const char *src_path, const char *dest_path, CopyProgress *
          * prompt (TOCTOU) would otherwise be followed and its target
          * truncated by a Retry's O_TRUNC open. */
         int open_flags = O_WRONLY | O_CREAT | O_NOFOLLOW | (dest_created ? O_TRUNC : O_EXCL);
-        /* 0600, not 0666: the file's permissions are only finalized to
-         * the source's real mode by fchmod() below AFTER the copy
-         * completes - creating it at the permissive default in the
-         * meantime would leave a private source file (e.g. a 0600 SSH
-         * key) briefly world-readable-minus-umask while its content is
-         * still being written, and permanently so if the process is
-         * killed mid-copy before the fchmod() runs. Narrow-then-widen is
-         * the safe direction: a source file that's actually MORE
-         * permissive than 0600 still ends up correctly widened by the
-         * fchmod() at the end, it just isn't briefly too-open first. */
+        /* 0600, not 0666: the real mode is only applied by fchmod() after
+         * the copy completes, so a private source (e.g. an SSH key) would
+         * otherwise sit readable under the umask while being written - or
+         * permanently, if tfm is killed mid-copy. Narrow-then-widen is the
+         * safe direction. */
         int dest_fd = open(dest_path, open_flags, 0600);
         FILE *out = (dest_fd != -1) ? fdopen(dest_fd, "wb") : NULL;
         if (out == NULL) {
@@ -261,10 +240,10 @@ static int copy_file(const char *src_path, const char *dest_path, CopyProgress *
              * before close()/unlink()/fclose() below can clobber it. */
             int saved_errno = errno;
             if (dest_fd != -1) {
-                /* open() succeeded but fdopen() failed - the file exists
-                 * (freshly created or truncated) but is now an orphaned
-                 * empty file. Remove it and reset dest_created so a Retry
-                 * uses O_EXCL again instead of hitting EEXIST forever. */
+                /* open() succeeded but fdopen() failed, leaving an
+                 * orphaned empty file. Remove it and reset dest_created so
+                 * a Retry uses O_EXCL again instead of hitting EEXIST
+                 * forever. */
                 close(dest_fd);
                 unlink(dest_path);
                 dest_created = 0;
@@ -290,10 +269,8 @@ static int copy_file(const char *src_path, const char *dest_path, CopyProgress *
         long long bytes_before_attempt = progress->copied_bytes;
 
         int failed = 0;
-        /* Captured at the point of the specific failure below (fwrite,
-         * ferror, or fclose further down) so the eventual error message
-         * names the real cause instead of always saying the same generic
-         * "Error writing" with no detail. */
+        /* Captured at the specific failure below (fwrite, ferror, or
+         * fclose) so the error message names the real cause. */
         int write_errno = 0;
         char buffer[65536];
         size_t n;
@@ -312,13 +289,10 @@ static int copy_file(const char *src_path, const char *dest_path, CopyProgress *
             }
 
             /* fread() only returns a short count at EOF or on a read
-             * error (C11 7.21.8.1), and ferror() below tells the two
-             * apart - so stop here instead of issuing one more fread()
-             * that can only return 0. Behavior is identical either way;
-             * this just gives clang's unix.Stream checker (scan-build)
-             * a loop shape it can follow, instead of it flagging the
-             * extra call as "read in EOF state" - a false positive that
-             * otherwise kept `make scan` from ever being clean. */
+             * error (C11 7.21.8.1), which ferror() below tells apart, so
+             * one more fread() could only return 0. Stopping here gives
+             * scan-build's unix.Stream checker a loop shape it can follow
+             * instead of a false "read in EOF state" report. */
             if (n < sizeof(buffer)) {
                 break;
             }
@@ -333,48 +307,30 @@ static int copy_file(const char *src_path, const char *dest_path, CopyProgress *
         }
 
         if (!failed) {
-            /* Preserve the source's permissions instead of the process
-             * default (open() with 0666 & ~umask): otherwise a copied
-             * executable loses its x-bit, or a private 0600 file (e.g. an
-             * SSH key) ends up 0644 (world-readable) under a typical
-             * umask. Masked to 0777 (not 07777): setuid/setgid on a
-             * regular file must never be carried over to a copy made by
-             * a different, possibly unprivileged, owner. Reuses the
-             * src_st already stat()'d at the top of this function instead
-             * of re-stat()ing the same unchanged path. */
+            /* Preserve the source's permissions: otherwise a copied
+             * executable loses its x-bit, or a 0600 file ends up
+             * world-readable under a typical umask. Masked to 0777:
+             * setuid/setgid must never carry over to a copy made by a
+             * different, possibly unprivileged, owner. */
             if (have_src_st) {
-                /* fwrite() above is buffered in userspace - without this
-                 * flush, the buffered bytes are still unwritten at the
-                 * kernel level when futimens() runs below, and the
-                 * eventual real write() (triggered by the fclose() calls
-                 * further down) bumps mtime back to "now" as an ordinary
-                 * side effect of writing data, silently undoing the
-                 * timestamp restore. Caught by testing the actual copied
-                 * file's timestamp, not just futimens()'s return value
-                 * (which reports success either way). */
+                /* Flush first: fwrite() is buffered, and the real write()
+                 * at fclose() would bump mtime back to "now", silently
+                 * undoing the futimens() below. */
                 fflush(out);
 
                 fchmod(fileno(out), src_st.st_mode & 0777);
 
-                /* Best-effort: fchown() to the source's owner/group only
-                 * succeeds for root (CAP_CHOWN) or when the caller is
-                 * already a member of the target group - for a normal,
-                 * unprivileged user copying their own files this is a
-                 * harmless no-op (they already own the new file), but
-                 * for a root-run backup/restore it preserves ownership
-                 * instead of silently reassigning everything to root.
-                 * Failure (EPERM) is expected and ignored - there is no
-                 * Retry/Skip/Abort question to ask the user here, this is
-                 * metadata preservation, not the operation itself. (void)
-                 * does NOT silence glibc's warn_unused_result on this
-                 * function - an empty if-body is the actual idiom. */
+                /* Best-effort: only succeeds for root (or a member of the
+                 * target group), where it keeps a root-run backup/restore
+                 * from reassigning everything to root; EPERM otherwise is
+                 * expected. An empty if-body, because (void) doesn't
+                 * silence glibc's warn_unused_result. */
                 if (fchown(fileno(out), src_st.st_uid, src_st.st_gid) != 0) {
                 }
 
-                /* Best-effort: preserve mtime/atime so a copy doesn't
-                 * look "just modified" (breaks incremental-backup tools,
-                 * build-cache freshness checks, and just plain misleads
-                 * the user about when a file was actually last changed). */
+                /* Best-effort: preserve mtime/atime so a copy doesn't look
+                 * "just modified" to backup tools, build caches, or the
+                 * user. */
                 struct timespec times[2];
                 times[0] = src_st.st_atim;
                 times[1] = src_st.st_mtim;
@@ -388,11 +344,9 @@ static int copy_file(const char *src_path, const char *dest_path, CopyProgress *
         int out_close_errno = errno;
         if (!failed && (in_close_failed || out_close_failed)) {
             /* A buffered write error (e.g. ENOSPC) can surface only at
-             * fclose(), after every fwrite() appeared to succeed. Prefer
-             * the write side's errno since that's the fclose whose
-             * failure actually corrupted the copy; the read side closing
-             * badly is comparatively harmless (the data was already
-             * fully read). */
+             * fclose(), after every fwrite() appeared to succeed. The
+             * write side's errno is preferred: that's the failure that
+             * actually corrupted the copy. */
             write_errno = out_close_failed ? out_close_errno : in_close_errno;
             failed = 1;
         }
@@ -436,15 +390,11 @@ static int remove_existing_for_overwrite(const char *dest, const struct stat *de
             return 1;
         }
         int saved_errno = errno;
-        /* An ignored unlink() failure (e.g. EPERM on an immutable file)
-         * used to fall through silently: the caller's subsequent
-         * O_EXCL/mkdir create would then fail EEXIST against the entry
-         * that was never actually removed, and Retry would just hit the
-         * same silent unlink() failure again - an infinite dialog loop
-         * with no indication of the real cause. Skip has no well-defined
-         * meaning at this layer (the caller already committed to
-         * overwriting), so it's treated the same as Abort: stop this
-         * entry rather than silently proceeding as if it were removed. */
+        /* Reported here (e.g. EPERM on an immutable file): ignored, the
+         * caller's O_EXCL/mkdir create would fail EEXIST against the
+         * still-present entry, in an endless Retry loop that never names
+         * the real cause. Skip has no meaning at this layer (the caller
+         * already committed to overwriting), so it's treated as Abort. */
         char msg[PATH_MAX + 128];
         snprintf(msg, sizeof(msg), "%s: %s", dest, strerror(saved_errno));
         FileOpChoice choice = report_error(cb, "Cannot remove", msg);
@@ -462,12 +412,9 @@ static int copy_recursive_impl(const char *src, const char *dest, CopyProgress *
                                 const FileOpCallbacks *cb, int *had_skip, int depth)
 {
     if (depth > MAX_RECURSION_DEPTH) {
-        /* Unlike compute_total_size_impl()'s "just an estimate" case,
-         * this function is about to actually copy real data - fail
-         * loudly through the normal Retry/Skip/Abort machinery instead
-         * of silently stopping partway (Retry can't help here - the
-         * tree's depth won't change - but the choice is still routed
-         * through so the caller sees a consistent contract). */
+        /* Unlike compute_total_size_impl()'s estimate, this copies real
+         * data, so it fails loudly instead of stopping partway silently.
+         * Retry can't change the tree's depth, so only Skip is honored. */
         FileOpChoice choice = report_error(cb, "Directory tree too deep", src);
         if (choice == FILEOPS_CHOICE_SKIP) {
             *had_skip = 1;
@@ -590,24 +537,15 @@ static int copy_recursive_impl(const char *src, const char *dest, CopyProgress *
     }
 
     for (;;) {
-        /* mkdir()'s mode argument is masked by umask, so passing
-         * st.st_mode here alone is not enough to preserve the source's
-         * permissions - a 0777/0775 shared directory would silently come
-         * out as 0755 under a typical umask 022. A follow-up chmod() below
-         * (on the newly-created-here path only) closes that gap, mirroring
-         * fchmod() in copy_file(). On EEXIST, an already-existing
-         * destination directory's permissions are left untouched (no
-         * downgrade of a deliberately set permission via merge). */
+        /* mkdir()'s mode is masked by umask (a 0775 shared directory
+         * would come out 0755), so the chmod() below reapplies it - on a
+         * newly created directory only, so merging into an existing one
+         * never changes its deliberately set permissions. */
         if (mkdir(dest, st.st_mode & 07777) == 0) {
             chmod(dest, st.st_mode & 07777);
-            /* Best-effort, same reasoning as copy_file()'s fchown() -
-             * harmless no-op for a normal user, preserves ownership for
-             * a root-run backup/restore. Directory mtime is deliberately
-             * NOT restored here: it will be repeatedly overwritten as
-             * this directory's own entries are copied into it below, so
-             * setting it now would just be discarded. (void) does NOT
-             * silence glibc's warn_unused_result on this function - an
-             * empty if-body is the actual idiom. */
+            /* Best-effort, as with copy_file()'s fchown(). Directory mtime
+             * is not restored: copying the entries into it below would
+             * overwrite it anyway. */
             if (chown(dest, st.st_uid, st.st_gid) != 0) {
             }
             break;
@@ -625,10 +563,9 @@ static int copy_recursive_impl(const char *src, const char *dest, CopyProgress *
                  * (e.g. resuming a partially copied tree), no need to ask. */
                 break;
             }
-            /* Type mismatch: dest exists but is a file or symlink, not a
-             * directory. Tolerating this used to surface a confusing
-             * ENOTDIR from the following opendir(dest) instead of asking;
-             * now handled like any other conflict. */
+            /* Type mismatch: dest is a file or symlink, not a directory.
+             * Asked like any other conflict, rather than letting the
+             * opendir(dest) below fail with a confusing ENOTDIR. */
             FileOpChoice choice = report_overwrite(cb, dest);
             if (choice != FILEOPS_CHOICE_OVERWRITE) {
                 if (choice == FILEOPS_CHOICE_SKIP) {
@@ -638,12 +575,9 @@ static int copy_recursive_impl(const char *src, const char *dest, CopyProgress *
                 return 0;
             }
             if (unlink(dest) != 0) {
-                /* Without checking this, a persistent removal failure
-                 * (e.g. EPERM) would just re-hit EEXIST and re-ask
-                 * "overwrite?" for an entry that already answered
-                 * OVERWRITE and still can't actually be removed -
-                 * looping the same prompt instead of surfacing the real
-                 * cause. */
+                /* Otherwise a persistent failure (e.g. EPERM) re-hits
+                 * EEXIST and loops the "overwrite?" prompt without ever
+                 * naming the real cause. */
                 int unlink_errno = errno;
                 char unlink_msg[PATH_MAX + 128];
                 snprintf(unlink_msg, sizeof(unlink_msg), "%s: %s", dest, strerror(unlink_errno));
@@ -694,12 +628,9 @@ static int copy_recursive_impl(const char *src, const char *dest, CopyProgress *
 
     struct dirent *entry;
     for (;;) {
-        /* errno reset right before every readdir() call: the loop body
-         * recurses into copy_recursive() for subdirectories, which runs
-         * plenty of its own syscalls that can leave errno set without
-         * that being a real failure of THIS readdir() - resetting only
-         * once before the loop would misattribute that stale errno to
-         * this loop's own, successful EOF return. */
+        /* errno reset before every readdir(), not once before the loop:
+         * the recursive call below can leave errno set, which would be
+         * misread as a failure of this loop's successful EOF return. */
         while ((errno = 0, entry = readdir(dp)) != NULL) {
             if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
                 continue;
@@ -730,11 +661,9 @@ static int copy_recursive_impl(const char *src, const char *dest, CopyProgress *
         int saved_errno = errno;
         char msg[PATH_MAX + 128];
         snprintf(msg, sizeof(msg), "%s: %s", src, strerror(saved_errno));
-        /* readdir() returning NULL means EOF or error alike - without
-         * this check, a mid-read failure (EIO on a flaky mount) silently
-         * looks like "done copying this directory", leaving entries
-         * added to the source after the failure point uncopied with no
-         * indication anything went wrong. */
+        /* readdir() returns NULL for EOF and error alike; without this, a
+         * mid-read failure (EIO on a flaky mount) would silently leave the
+         * rest of the directory uncopied. */
         FileOpChoice choice = report_error(cb, "Error reading", msg);
         if (choice == FILEOPS_CHOICE_RETRY) {
             continue;
@@ -760,10 +689,8 @@ static int copy_recursive(const char *src, const char *dest, CopyProgress *progr
 /* Checks whether dir equals src or (resolved via realpath, so symlink
  * detours are caught too) lies underneath src. Without this,
  * fileops_copy("/a/proj", "/a/proj/sub", cb) would keep copying the
- * freshly created destination into itself, a self-deepening copy that
- * only stops at PATH_MAX. Returns 0 on realpath() failure (e.g. dest
- * doesn't exist yet) rather than falsely blocking; the existing inode-
- * comparison data-loss guard covers the rest. */
+ * freshly created destination into itself until PATH_MAX. Returns 0 if
+ * src itself can't be resolved. */
 static int dir_is_or_contains(const char *dir, const char *src)
 {
     char real_src[PATH_MAX];
@@ -771,13 +698,10 @@ static int dir_is_or_contains(const char *dir, const char *src)
         return 0;
     }
 
-    /* dir (the destination) may not exist yet - e.g. copying src into a
-     * not-yet-created subdirectory of itself - so realpath(dir) failing
-     * used to be treated as "not contained", bypassing this guard for
-     * exactly the case it exists to catch. Walk up to the nearest
-     * existing ancestor of dir instead: if that ancestor already lies
-     * under src, every not-yet-created descendant mkdir() would create
-     * under it does too. */
+    /* dir may not exist yet (e.g. a not-yet-created subdirectory of src),
+     * so realpath(dir) failing can't mean "not contained". Walk up to the
+     * nearest existing ancestor instead: if it lies under src, so does
+     * everything that would be created beneath it. */
     char probe[PATH_MAX];
     if ((size_t)snprintf(probe, sizeof(probe), "%s", dir) >= sizeof(probe)) {
         return 0;
@@ -821,7 +745,7 @@ static void strip_trailing_slashes(char *path)
 /* True for a path with no safe basename to operate on: NULL, empty, "/",
  * ".", or "..". Without this, fileops_copy("/", dest, cb) computes an
  * empty base and the EEXIST merge path silently copies the entire
- * filesystem into dest; fileops_delete("/", cb) had no guard at all. */
+ * filesystem into dest, and fileops_delete("/", cb) would delete it. */
 static int is_unsafe_root_path(const char *path)
 {
     return path == NULL || path[0] == '\0' || strcmp(path, "/") == 0 ||
@@ -836,10 +760,8 @@ void fileops_copy(const char *src, const char *dest_dir, const FileOpCallbacks *
     }
 
     char normalized_src[PATH_MAX];
-    /* Unlike path_join() elsewhere in this file, a truncated src here
-     * can't just be caught by the caller re-checking dest - it would
-     * silently operate on a different, shorter path than the one passed
-     * in, so check the return value explicitly instead of ignoring it. */
+    /* A truncated src would silently operate on a different, shorter
+     * path than the one passed in, so truncation is an error. */
     if ((size_t)snprintf(normalized_src, sizeof(normalized_src), "%s", src) >=
         sizeof(normalized_src)) {
         report_error(cb, "Path too long", src);
@@ -906,11 +828,9 @@ static int delete_recursive_impl(const char *path, const FileOpCallbacks *cb, in
         }
         int saved_errno = errno;
         if (saved_errno == ENOENT) {
-            /* Already gone (e.g. removed by another process between the
-             * caller listing it and this call) - the goal of "path no
-             * longer exists" is already met, so treat this as success
-             * instead of looping Retry forever against an entry that will
-             * never come back. */
+            /* Already gone (e.g. removed by another process since it was
+             * listed) - the goal is met, so succeed instead of looping
+             * Retry against an entry that will never come back. */
             return 1;
         }
         char msg[PATH_MAX + 128];
@@ -969,11 +889,9 @@ static int delete_recursive_impl(const char *path, const FileOpCallbacks *cb, in
             int saved_errno = errno;
             char msg[PATH_MAX + 128];
             snprintf(msg, sizeof(msg), "%s: %s", path, strerror(saved_errno));
-            /* Without this check, a mid-read readdir() failure (EIO on a
-             * flaky mount) silently looks like "directory fully
-             * enumerated", leaving unprocessed entries behind - the
-             * subsequent rmdir() below would then just fail ENOTEMPTY
-             * with no indication why. */
+            /* A mid-read readdir() failure (EIO on a flaky mount) would
+             * otherwise look like a complete listing, and the rmdir()
+             * below would fail ENOTEMPTY with no indication why. */
             FileOpChoice choice = report_error(cb, "Error reading", msg);
             if (choice == FILEOPS_CHOICE_RETRY) {
                 continue;
@@ -1087,12 +1005,10 @@ void fileops_move(const char *src, const char *dest_dir, const FileOpCallbacks *
     }
 
     struct stat existing;
-    /* lstat, not stat, as in copy_file(): stat() would fail with ENOENT on
-     * a dangling symlink at dest, skipping the overwrite branch entirely
-     * and letting rename() silently replace the broken symlink without
-     * asking - breaking the "asks before overwriting" contract documented
-     * in fileops.h. lstat() catches the symlink itself (dangling or not)
-     * and treats it as its own entry, consistent with copy_recursive(). */
+    /* lstat, not stat, as in copy_file(): stat() fails ENOENT on a
+     * dangling symlink at dest, which would let rename() replace it
+     * without asking, breaking fileops.h's "asks before overwriting"
+     * contract. */
     if (lstat(dest, &existing) == 0) {
         FileOpChoice choice = report_overwrite(cb, dest);
         if (choice != FILEOPS_CHOICE_OVERWRITE) {
@@ -1105,13 +1021,10 @@ void fileops_move(const char *src, const char *dest_dir, const FileOpCallbacks *
         int dest_is_dir = S_ISDIR(existing.st_mode);
 
         if (src_is_dir && dest_is_dir) {
-            /* Both sides are directories: don't delete the existing
-             * destination wholesale - that would destroy files that exist
-             * only in the destination, not the source (real data loss).
-             * Merge instead, like fileops_copy() does (copy_recursive()
-             * tolerates an existing destination directory and only asks
-             * per file conflict), then remove the source to fulfill move
-             * semantics. */
+            /* Both sides are directories: merge (asking per file
+             * conflict, like fileops_copy()) instead of deleting the
+             * destination wholesale, which would destroy files that exist
+             * only there. Then remove the source. */
             CopyProgress progress;
             progress.total_bytes = compute_total_size(src, cb);
             progress.copied_bytes = 0;
@@ -1122,21 +1035,15 @@ void fileops_move(const char *src, const char *dest_dir, const FileOpCallbacks *
             int had_skip = 0;
             if (copy_recursive(src, dest, &progress, cb, &had_skip)) {
                 if (had_skip) {
-                    /* At least one entry was Skipped rather than actually
-                     * copied - deleting the source here would destroy
-                     * exactly the files the user chose to keep. Leave the
-                     * whole source tree in place instead of guessing which
-                     * parts are now safe to remove. */
+                    /* Deleting the source would destroy exactly the files
+                     * the user chose to Skip, so the whole source tree is
+                     * left in place. */
                     report_error(cb, "Move incomplete",
                                  "Some files were skipped and were not moved; source left in place.");
                 } else if (!delete_recursive(src, cb)) {
-                    /* copy_recursive() succeeded fully (had_skip == 0) but
-                     * the source-side delete itself failed or was
-                     * aborted (e.g. a read-only source entry) - without
-                     * this check the function returned as if the move
-                     * had fully succeeded, leaving both the copy and the
-                     * un-deleted source on disk with no indication
-                     * anything was left behind. */
+                    /* The copy succeeded but removing the source failed or
+                     * was aborted (e.g. a read-only source entry) - say so
+                     * rather than report the move as complete. */
                     report_error(cb, "Move incomplete",
                                  "Copied, but could not remove the original; source left in place.");
                 }
@@ -1179,46 +1086,31 @@ void fileops_move(const char *src, const char *dest_dir, const FileOpCallbacks *
             report_error(cb, "Move incomplete",
                          "Some files were skipped and were not moved; source left in place.");
         } else if (!delete_recursive(src, cb)) {
-            /* Same gap as the dir-merge branch above: the cross-fs copy
-             * fully succeeded but deleting the now-redundant source
-             * failed/was aborted - report it instead of returning
-             * silently as if the move had fully completed. */
+            /* As in the dir-merge branch above: the copy succeeded but
+             * removing the source didn't. */
             report_error(cb, "Move incomplete",
                          "Copied, but could not remove the original; source left in place.");
         }
     }
 }
 
-/* Moves src to the exact path dest (not "into" a directory - dest is
- * the full destination path), via rename() first and a copy+delete
- * fallback across filesystems. Shared by fileops_trash() and
- * fileops_restore_last_trashed() so both reuse the same cross-device-
- * safe move semantics fileops_move() already has, without going
- * through its dest_dir/basename-joining logic - trash needs an exact,
- * collision-resolved destination name, not src's own basename. Returns
- * 1 on success, 0 if aborted/failed (reported via cb). */
+/* Moves src to the exact path dest (the full destination path, not a
+ * directory to move into), via rename() with a copy+delete fallback
+ * across filesystems. Used by fileops_trash() and
+ * fileops_restore_last_trashed(), which need an exact, collision-resolved
+ * destination name rather than fileops_move()'s dest_dir/basename
+ * joining. Returns 1 on success, 0 if aborted/failed (reported via cb). */
 static int move_to_exact_dest(const char *src, const char *dest, const FileOpCallbacks *cb)
 {
-    /* renameat2(..., RENAME_NOREPLACE) instead of a plain rename(): a bare
-     * rename() atomically REPLACES dest if it already exists, with no way
-     * to ask it not to - both callers of this function rely on dest being
-     * a just-verified-free name/path (fileops_trash()'s
-     * unique_trash_name(), fileops_restore_last_trashed()'s lstat()
-     * check), but a plain rename() re-opens a TOCTOU window between that
-     * check and the actual rename (e.g. two trash operations racing on
-     * the same source basename, or a file created at the restore target
-     * in that narrow window) that would otherwise silently destroy
-     * whatever was already at dest. RENAME_NOREPLACE makes the kernel
-     * enforce "only if dest doesn't exist" atomically, closing the race
-     * outright instead of just narrowing it. */
+    /* RENAME_NOREPLACE: both callers have just verified dest is free, but
+     * a plain rename() atomically replaces whatever appears there in the
+     * meantime (e.g. two trash operations racing on the same basename),
+     * silently destroying it. The kernel flag closes that TOCTOU window. */
     int renamed = renameat2(AT_FDCWD, src, AT_FDCWD, dest, RENAME_NOREPLACE) == 0;
     if (!renamed && (errno == EINVAL || errno == ENOSYS)) {
-        /* RENAME_NOREPLACE isn't supported by every kernel/filesystem
-         * (needs Linux >=3.15, and some FUSE/network filesystems still
-         * don't implement it) - fall back to a plain rename() rather than
-         * refusing the move outright on an otherwise-working system. This
-         * reopens the race above, but only on filesystems where the
-         * atomic check was never available to begin with. */
+        /* Not supported by every kernel/filesystem (Linux < 3.15, some
+         * FUSE/network filesystems) - fall back to plain rename() there
+         * rather than refuse the move. */
         renamed = rename(src, dest) == 0;
     }
     if (renamed) {
@@ -1310,19 +1202,13 @@ static int get_trash_dirs(char *files_dir, size_t files_size, char *info_dir, si
     return mkdir_parents(files_dir, 0700) && mkdir_parents(info_dir, 0700);
 }
 
-/* Finds a name for basename that doesn't already exist as either
- * files_dir/<name> or info_dir/<name>.trashinfo (checked with lstat, so a
- * leftover dangling symlink still counts as "taken"), appending " (1)",
- * " (2)", ... on collision. Writes the chosen name (not a full path) into
- * out_name. The same name (with the same suffix, if any) is used for both
- * files/<name> and info/<name>.trashinfo - fileops_restore_last_trashed()
- * relies on that exact pairing to find the trashed item that matches a
- * given metadata file. Both directories are checked (not just files_dir):
- * an orphaned .trashinfo file (e.g. left behind by a process killed
- * between fileops_restore_last_trashed()'s move-back and its cleanup
- * remove() of the old metadata) would otherwise pass a files_dir-only
- * check and then get silently overwritten by fopen(info_path, "w") when
- * a later, unrelated trash operation happens to generate the same name. */
+/* Finds a name for basename, appending " (1)", " (2)", ... on collision,
+ * that is free as both files_dir/<name> and info_dir/<name>.trashinfo
+ * (lstat, so a dangling symlink counts as taken), and writes it (not a
+ * full path) into out_name. fileops_restore_last_trashed() relies on that
+ * exact files/info pairing. info_dir is checked too because an orphaned
+ * .trashinfo (e.g. from a restore killed before its cleanup) would
+ * otherwise be silently overwritten by a later trash of the same name. */
 static int unique_trash_name(const char *files_dir, const char *info_dir, const char *basename,
                               char *out_name, size_t out_name_size)
 {
@@ -1348,13 +1234,10 @@ static int unique_trash_name(const char *files_dir, const char *info_dir, const 
     return 0;
 }
 
-/* Percent-encodes path for a .trashinfo "Path=" line, per the
- * freedesktop.org trash spec (everything except a small unreserved set
- * must be encoded) - without this, a path containing e.g. a space or a
- * non-ASCII byte would produce a malformed/ambiguous key file that other
- * trash-spec-aware tools (and this codebase's own decoder below) could
- * misparse. Silently stops (leaving out valid so far) if out is too
- * small rather than overflowing it. */
+/* Percent-encodes path for a .trashinfo "Path=" line, as the
+ * freedesktop.org trash spec requires - a raw space or non-ASCII byte
+ * would make the key file ambiguous to other trash tools and to the
+ * decoder below. Stops early (out stays valid) if out is too small. */
 static void percent_encode_path(const char *path, char *out, size_t out_size)
 {
     static const char *unreserved =
@@ -1495,21 +1378,15 @@ int fileops_restore_last_trashed(const FileOpCallbacks *cb, char *restored_path_
         return 0;
     }
 
-    /* Finds the *.trashinfo file with the newest mtime - that file's own
-     * mtime is effectively its deletion time, since fileops_trash() just
-     * wrote it, so no separate DeletionDate parsing is needed to find
-     * the most recent one. */
+    /* Finds the *.trashinfo file with the newest mtime - fileops_trash()
+     * writes it at deletion time, so no DeletionDate parsing is needed. */
     static const char trashinfo_suffix[] = ".trashinfo";
     char newest_name[PATH_MAX] = "";
     time_t newest_mtime = 0;
     struct dirent *entry;
-    /* errno reset right before every readdir() call, not just once before
-     * the loop - matching copy_recursive_impl()/delete_recursive_impl()'s
-     * pattern (see their own comments): without this, readdir() returning
-     * NULL for a mid-scan error (e.g. EIO on a flaky mount) looks
-     * identical to a normal, complete "directory fully enumerated" EOF,
-     * silently reporting "trash is empty" even when a real trashed item
-     * exists and simply wasn't seen. */
+    /* errno reset before every readdir(), as in copy_recursive_impl(), so
+     * a mid-scan error (e.g. EIO) is told apart from EOF instead of
+     * silently reporting "trash is empty". */
     while ((errno = 0, entry = readdir(dp)) != NULL) {
         size_t name_len = strlen(entry->d_name);
         size_t suffix_len = sizeof(trashinfo_suffix) - 1;
@@ -1579,13 +1456,9 @@ int fileops_restore_last_trashed(const FileOpCallbacks *cb, char *restored_path_
         return 0;
     }
 
-    /* Never overwrite: if something now occupies the original spot
-     * (e.g. a new file was created with that name after the trash), fail
-     * cleanly instead of silently clobbering it - there's no
-     * Retry/Skip/Abort question that makes sense here, unlike a normal
-     * copy/move conflict, since the "conflict" is with unrelated data
-     * the user created after the delete, not a stale copy of the same
-     * operation. */
+    /* Never overwrite: whatever occupies the original spot now is
+     * unrelated data created after the delete, not a conflicting copy,
+     * so fail cleanly instead of offering an Overwrite prompt. */
     struct stat existing;
     if (lstat(original_path, &existing) == 0) {
         report_error(cb, "Cannot undo", "Something already exists at the original location.");

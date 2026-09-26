@@ -22,12 +22,10 @@ int shell_execute_cb(const char *command, const char *cwd, void (*pump)(void *ct
     }
 
     if (pid == 0) {
-        /* Distinct exit codes so the caller (and shell_execute_cb()'s own
-         * WIFEXITED/WEXITSTATUS translation below) can tell "couldn't set
-         * up the child" apart from "the invoked command genuinely exited
-         * 127" - both used to _exit(127), making them indistinguishable.
-         * 126/127 follow the same convention POSIX shells use
-         * ("cannot execute" vs "command not found"). */
+        /* 126 for a failed chdir, 127 for a failed exec - the POSIX shell
+         * convention ("cannot execute" vs "command not found"), so the
+         * caller can tell a child setup failure from the command's own
+         * exit code. */
         if (chdir(cwd) != 0) {
             _exit(126);
         }
@@ -52,30 +50,17 @@ int shell_execute_cb(const char *command, const char *cwd, void (*pump)(void *ct
                      * which would leak a zombie. */
                     continue;
                 }
-                /* Any other waitpid() failure on a pid we just fork()ed
-                 * (realistically only ECHILD, meaning the child no
-                 * longer exists to wait for - there is no signal handler
-                 * anywhere in this process that could have reaped it
-                 * behind our back, so this means it's already gone, not
-                 * that a zombie was left behind). Nothing left to wait
-                 * for either way. */
+                /* Any other failure is realistically ECHILD: the child is
+                 * already gone, so there's nothing left to wait for. */
                 break;
             }
             if (result != 0) {
                 if (WIFSTOPPED(status)) {
-                    /* WUNTRACED above makes a stopped child (e.g. an
-                     * external `kill -STOP <pid>`, or a command that
-                     * suspends itself) visible instead of invisible to
-                     * WNOHANG - without it, this loop would just keep
-                     * polling and pumping forever with no indication
-                     * anything unusual happened, since waitpid() never
-                     * reports a state change for a merely-stopped child.
-                     * tfm has no job-control model (no fg/bg for the
-                     * shell bar), so there is no sensible "leave it
-                     * stopped" outcome here - resume it and keep waiting
-                     * for a real exit, same as a shell resuming a
-                     * background job that gets suspended by the
-                     * terminal driver. */
+                    /* A stopped child (e.g. `kill -STOP`, or a command
+                     * that suspends itself) would otherwise make this loop
+                     * poll forever. tfm has no job control, so there's no
+                     * sensible "leave it stopped" outcome - resume it and
+                     * keep waiting for a real exit. */
                     kill(pid, SIGCONT);
                     pump(pump_ctx);
                     struct timespec ts = {0, 20000000L};
@@ -107,10 +92,8 @@ int shell_execute_cb(const char *command, const char *cwd, void (*pump)(void *ct
         return WEXITSTATUS(status);
     }
     if (WIFSIGNALED(status)) {
-        /* 128+signal (the same convention shells use for $?) instead of
-         * -1: -1 previously meant both "killed by a signal" and "fork()/
-         * waitpid() itself failed", two very different situations a
-         * caller might want to react to differently. */
+        /* 128+signal, the shell $? convention, keeps "killed by a signal"
+         * distinct from -1 ("fork()/waitpid() itself failed"). */
         return 128 + WTERMSIG(status);
     }
     return -1;
