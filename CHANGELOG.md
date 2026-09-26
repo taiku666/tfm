@@ -3,7 +3,7 @@
 Versioned via `TFM_VERSION` in `include/tfm_common.h` and git tags
 (`vX.Y.Z`); this file tracks notable changes per release.
 
-## Unreleased
+## 0.6.0
 
 - **Enter opens the selection, F3 edits it (TUI and GUI).** Enter on a
   file now opens it in the desktop's default application for its type
@@ -18,6 +18,23 @@ Versioned via `TFM_VERSION` in `include/tfm_common.h` and git tags
   with no default application shows an error popup. F3 opens any file in
   `$EDITOR`; the `[editor]` extensions list in `tfm.ini` is gone (an old
   file with it still loads, and the section is dropped on the next save).
+- **Automated tests and CI.** Unit tests for fileops (with fault
+  injection and a real cross-filesystem move), tfm_common, config, input,
+  dir, panel, the Omarchy theme parser and the new opener, plus PTY
+  integration tests that drive the real `tfm` binary. CI builds with
+  `-Werror` and runs the tests, ASan/UBSan and scan-build.
+- **Build hardening.** The default build is now `-O2 -D_FORTIFY_SOURCE=2`
+  with `-Wconversion -Wshadow`, and `make scan` is a clean scan-build gate.
+- **Fixes.** A race in the trash code that could overwrite an existing
+  file; F6 Rename / F7 New folder accepting `/` or `..` and acting outside
+  the current directory; a failed directory read mistaken for an empty
+  trash; a panel showing a new path over its old listing when the new
+  directory failed to load; `colors.toml` inline comments dropping the
+  whole GUI theme; config load/save failures that were silent are now
+  reported; fileops error messages include the system's reason; Home/End/
+  PgUp/PgDn work in the TUI.
+- **Internal.** The TUI's `main()` key loop is split into one handler per
+  key, and code comments were trimmed to present-tense rationale.
 
 ## 0.5.0
 
