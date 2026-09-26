@@ -223,6 +223,18 @@ $(PTY_TEST_BIN): $(PTY_TEST_SRC) $(TARGET) | $(TEST_BUILD_DIR)
 test-pty: $(PTY_TEST_BIN)
 	./$(PTY_TEST_BIN)
 
+# compile_commands.json for clangd and other LSP-based editors: each file's
+# real flags (notably GTK's include paths for src_gui/), which the language
+# server can't infer from this Makefile. Gitignored, since it holds absolute
+# paths. awk leaves no trailing comma, which clangd's JSON parser rejects.
+CDB_ENTRY = {"directory": "$(CURDIR)", "file": "$(1)", "command": "$(CC) $(2) -c $(1)"}
+
+compile_commands.json: Makefile
+	@{ $(foreach f,$(SRCS) $(TEST_SRCS) $(PTY_TEST_SRC),echo '$(call CDB_ENTRY,$(f),$(ALL_CFLAGS) $(IFLAGS))';) \
+	   $(foreach f,$(GUI_SRCS),echo '$(call CDB_ENTRY,$(f),$(ALL_CFLAGS) $(IFLAGS) $(GTK_CFLAGS))';) } | \
+	 awk 'BEGIN { print "[" } NR > 1 { print prev "," } { prev = $$0 } END { if (NR) print prev; print "]" }' > $@
+	@echo "Wrote $@"
+
 # Best-effort static analysis; skipped (not failed) if cppcheck isn't
 # installed, so `make lint` is safe to run/CI-wire on any machine.
 lint:

@@ -21,6 +21,7 @@ make test-pty   # slower: spawns real bin/tfm in a pty for signal/EOF/terminal-r
 make lint       # cppcheck, if installed
 make asan       # tfm rebuilt with -fsanitize=address,undefined
 make asan-test  # unit-test rebuilt with -fsanitize=address,undefined
+make compile_commands.json  # for clangd/LSP editors: real per-file flags (gitignored)
 ```
 
 ## Before submitting a change
