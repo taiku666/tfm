@@ -1640,7 +1640,12 @@ static void apply_base_css(void)
         provider, ".tfm-panel-active { border: 2px solid @accent_color; padding: 3px; }\n"
                   ".tfm-panel-active .heading { color: @accent_color; }\n"
                   ".tfm-marked label { color: @accent_color; font-weight: bold; }\n"
-                  ".tfm-mark-summary { color: @accent_color; font-weight: bold; }\n");
+                  ".tfm-mark-summary { color: @accent_color; font-weight: bold; }\n"
+                  /* libadwaita draws no visible focus ring on dialog
+                   * responses, so a keyboard user can't see which one
+                   * Space would pick. :focus rather than :focus-visible:
+                   * a click on a response closes the dialog anyway. */
+                  "dialog button:focus { outline: 2px solid @accent_color; outline-offset: 2px; }\n");
     gtk_style_context_add_provider_for_display(display, GTK_STYLE_PROVIDER(provider),
                                                 GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
     g_object_unref(provider);

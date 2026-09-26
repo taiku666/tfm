@@ -5,6 +5,8 @@ Versioned via `TFM_VERSION` in `include/tfm_common.h` and git tags
 
 ## Unreleased
 
+- GUI dialogs now show a focus ring on the selected button, so keyboard
+  users can see which answer Space or Enter will pick.
 - **Multi-select (TUI and GUI).** Space (TUI: only with an empty `$`
   line, so it stays a space in commands) and Insert mark or unmark the
   highlighted entry and move down; `*` marks everything except `..`, or
