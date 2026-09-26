@@ -463,7 +463,7 @@ TEST(dangerous_root_paths_rejected_without_mutation)
         ASSERT_EQ(m.error_calls, 1);
 
         mock_reset(&m);
-        fileops_trash(dangerous[i], &cb);
+        fileops_trash(dangerous[i], &cb, NULL, 0);
         ASSERT_EQ(m.error_calls, 1);
     }
 
@@ -508,7 +508,7 @@ TEST(trash_round_trip)
     mock_reset(&m);
     FileOpCallbacks cb = mock_callbacks(&m);
 
-    fileops_trash(item, &cb);
+    fileops_trash(item, &cb, NULL, 0);
     ASSERT_FALSE(path_exists(item));
     ASSERT_EQ(m.error_calls, 0);
 
@@ -550,7 +550,7 @@ TEST(trash_restore_never_clobbers_occupied_destination)
     mock_reset(&m);
     FileOpCallbacks cb = mock_callbacks(&m);
 
-    fileops_trash(item, &cb);
+    fileops_trash(item, &cb, NULL, 0);
     ASSERT_FALSE(path_exists(item));
 
     /* Something else now occupies the original spot - a real file the
@@ -597,8 +597,8 @@ TEST(trash_name_collision_keeps_both)
     mock_reset(&m);
     FileOpCallbacks cb = mock_callbacks(&m);
 
-    fileops_trash(item_a, &cb);
-    fileops_trash(item_b, &cb);
+    fileops_trash(item_a, &cb, NULL, 0);
+    fileops_trash(item_b, &cb, NULL, 0);
     ASSERT_EQ(m.error_calls, 0);
 
     char trash_files[PATH_MAX];

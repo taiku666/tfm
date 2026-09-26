@@ -40,6 +40,15 @@ int builtin_cd(char *current_dir, const char *command, char *error_msg, size_t e
  * if len == 0, so callers can subtract the result unconditionally. */
 size_t utf8_prev_char_len(const char *buf, size_t len);
 
+/* Formats bytes for display, 1024-based: "512 B", "1.5 KB", "12.4 MB". */
+void format_size(long long bytes, char *out, size_t out_size);
+
+/* The marked-entries summary both front-ends show, e.g.
+ * "3 marked (1 folder), 12.4 MB". bytes covers the marked files only
+ * (folder sizes would need a full tree walk), so the size is left out
+ * when only folders are marked. */
+void format_mark_summary(size_t marked, size_t marked_dirs, long long bytes, char *out, size_t out_size);
+
 /* Returns str unchanged, hiding its array size from GCC's
  * -Wformat-truncation analysis (at -O2 -D_FORTIFY_SOURCE=2), which
  * assumes the worst case when it can't see the invariant that keeps a

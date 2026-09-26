@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "batch.h"
 #include "config.h"
 #include "editor.h"
 #include "fileops.h"
@@ -96,6 +97,7 @@ static void redraw_ui(const App *app)
     theme.text_color = cfg->text_color;
     theme.cursor_color = cfg->cursor_color;
     theme.dir_color = cfg->dir_color;
+    theme.mark_color = cfg->mark_color;
     theme.icons_enabled = strcasecmp(cfg->icons, "omarchy") == 0;
 
     static const FunctionKey FUNCTION_KEYS[] = {
@@ -238,11 +240,15 @@ static FileOpChoice tui_fileop_on_error(void *ctx, const char *title, const char
 static FileOpChoice tui_fileop_on_overwrite(void *ctx, const char *path)
 {
     (void)ctx;
-    switch (screen_prompt_overwrite(path)) {
+    switch (screen_prompt_overwrite(path, 1)) {
         case SCREEN_CHOICE_SKIP:
             return FILEOPS_CHOICE_SKIP;
+        case SCREEN_CHOICE_SKIP_ALL:
+            return FILEOPS_CHOICE_SKIP_ALL;
         case SCREEN_CHOICE_OVERWRITE:
             return FILEOPS_CHOICE_OVERWRITE;
+        case SCREEN_CHOICE_OVERWRITE_ALL:
+            return FILEOPS_CHOICE_OVERWRITE_ALL;
         default:
             return FILEOPS_CHOICE_ABORT;
     }
@@ -303,30 +309,97 @@ static void install_terminating_signal_handlers(void)
     }
 }
 
-/* F5: copy the selected entry into the other panel's directory. */
+/* The items F5/F6/F8 act on: every marked entry, or the highlighted one
+ * if nothing is marked (never ".."), as full paths. */
+typedef struct {
+    char **paths;
+    size_t count;
+} Targets;
+
+static void free_targets(Targets *targets)
+{
+    for (size_t i = 0; i < targets->count; i++) {
+        free(targets->paths[i]);
+    }
+    free(targets->paths);
+    targets->paths = NULL;
+    targets->count = 0;
+}
+
+/* Returns 0 if there is nothing to act on, or after reporting a failure. */
+static int collect_targets(const Panel *panel, Targets *targets)
+{
+    targets->paths = NULL;
+    targets->count = 0;
+
+    const DirEntryInfo *single = NULL;
+    size_t wanted = panel->marks != NULL ? panel->mark_count : 0;
+    if (wanted == 0) {
+        single = selected_file_entry(panel);
+        if (single == NULL) {
+            return 0;
+        }
+        wanted = 1;
+    }
+
+    targets->paths = calloc(wanted, sizeof(*targets->paths));
+    if (targets->paths == NULL) {
+        tui_show_popup("Error", "Out of memory");
+        return 0;
+    }
+    for (size_t i = 0; i < panel->count && targets->count < wanted; i++) {
+        const DirEntryInfo *entry = &panel->entries[i];
+        if (single != NULL ? entry != single : !panel->marks[i]) {
+            continue;
+        }
+        char path[PATH_MAX];
+        if (!path_join(path, sizeof(path), panel->path, entry->name) ||
+            (targets->paths[targets->count] = strdup(path)) == NULL) {
+            free_targets(targets);
+            tui_show_popup("Error", "Path too long");
+            return 0;
+        }
+        targets->count++;
+    }
+    if (targets->count == 0) {
+        free_targets(targets);
+        return 0;
+    }
+    return 1;
+}
+
+/* Runs op over targets with the cursor hidden. Marks are cleared once the
+ * batch completes; after an abort they stay, so the user can retry. */
+static int run_batch(BatchOp op, Panel *source, Targets *targets, const char *dest_dir)
+{
+    screen_hide_cursor();
+    int completed = batch_run(op, (const char *const *)targets->paths, targets->count, dest_dir,
+                              &tui_fileop_callbacks);
+    screen_show_cursor();
+    /* Discard a resize that happened during the operation; otherwise the
+     * next real keypress in the main loop would be misread as "just a
+     * resize" (see input_consume_resize_flag()). */
+    input_consume_resize_flag();
+    if (completed) {
+        panel_clear_marks(source);
+    }
+    free_targets(targets);
+    return completed;
+}
+
+/* F5: copy the marked entries (or the highlighted one) into the other
+ * panel's directory. */
 static void handle_copy(App *app)
 {
     Panel *active_panel = app_active_panel(app);
     Panel *other_panel = app_other_panel(app);
-    const DirEntryInfo *entry = selected_file_entry(active_panel);
+    Targets targets;
 
-    if (entry != NULL) {
-        char src_path[PATH_MAX];
-        if (!path_join(src_path, sizeof(src_path), active_panel->path, entry->name)) {
-            tui_show_popup("Error", "Path too long");
-        } else {
-            screen_hide_cursor();
-            fileops_copy(src_path, other_panel->path, &tui_fileop_callbacks);
-            screen_show_cursor();
-            /* Discard a resize that happened during the copy; otherwise
-             * the next real keypress in the main loop would be misread as
-             * "just a resize" (see input_consume_resize_flag()). */
-            input_consume_resize_flag();
-
-            /* Only the target panel changed; the source panel keeps its
-             * selection unless it shows the same directory. */
-            reload_panel_and_twin(other_panel, active_panel);
-        }
+    if (collect_targets(active_panel, &targets)) {
+        run_batch(BATCH_COPY, active_panel, &targets, other_panel->path);
+        /* Only the target panel changed; the source panel keeps its
+         * selection unless it shows the same directory. */
+        reload_panel_and_twin(other_panel, active_panel);
     }
 
     redraw_ui(app);
@@ -362,7 +435,7 @@ static void rename_selected_in_place(Panel *active_panel, Panel *other_panel, co
     }
     /* A declined overwrite is a silent no-op, matching Skip/Abort
      * elsewhere. */
-    if (lstat(new_path, &existing_st) == 0 && screen_prompt_overwrite(new_path) != SCREEN_CHOICE_OVERWRITE) {
+    if (lstat(new_path, &existing_st) == 0 && screen_prompt_overwrite(new_path, 0) != SCREEN_CHOICE_OVERWRITE) {
         return;
     }
 
@@ -374,32 +447,27 @@ static void rename_selected_in_place(Panel *active_panel, Panel *other_panel, co
     }
 }
 
-/* F6: move the selected entry into the other panel's directory. */
+/* F6: move the marked entries (or the highlighted one) into the other
+ * panel's directory. With both panels in the same directory it renames
+ * the highlighted entry instead, marks or not. */
 static void handle_move(App *app)
 {
     Panel *active_panel = app_active_panel(app);
     Panel *other_panel = app_other_panel(app);
-    const DirEntryInfo *entry = selected_file_entry(active_panel);
 
-    if (entry != NULL) {
-        if (strcmp(active_panel->path, other_panel->path) == 0) {
+    if (strcmp(active_panel->path, other_panel->path) == 0) {
+        const DirEntryInfo *entry = selected_file_entry(active_panel);
+        if (entry != NULL) {
             rename_selected_in_place(active_panel, other_panel, entry);
-        } else {
-            char src_path[PATH_MAX];
-            if (!path_join(src_path, sizeof(src_path), active_panel->path, entry->name)) {
-                tui_show_popup("Error", "Path too long");
-            } else {
-                screen_hide_cursor();
-                fileops_move(src_path, other_panel->path, &tui_fileop_callbacks);
-                screen_show_cursor();
-                /* See comment in handle_copy(). */
-                input_consume_resize_flag();
-
-                /* Unlike copy, the source panel also changes (entry
-                 * disappears). */
-                panel_reload(active_panel);
-                panel_reload(other_panel);
-            }
+        }
+    } else {
+        Targets targets;
+        if (collect_targets(active_panel, &targets)) {
+            run_batch(BATCH_MOVE, active_panel, &targets, other_panel->path);
+            /* Unlike copy, the source panel also changes (entries
+             * disappear). */
+            panel_reload(active_panel);
+            panel_reload(other_panel);
         }
     }
 
@@ -432,60 +500,71 @@ static void handle_mkdir(App *app)
     redraw_ui(app);
 }
 
-/* F8: move the selected entry to the trash, or delete it for good with
- * Shift+F8 - e.g. for a large file not worth doubling disk usage for, or
- * sensitive data that shouldn't linger in ~/.local/share/Trash. */
+/* F8: move the marked entries (or the highlighted one) to the trash, or
+ * delete them for good with Shift+F8 - e.g. for a large file not worth
+ * doubling disk usage for, or sensitive data that shouldn't linger in
+ * ~/.local/share/Trash. */
 static void handle_delete(App *app, int permanent)
 {
     Panel *active_panel = app_active_panel(app);
     Panel *other_panel = app_other_panel(app);
-    const DirEntryInfo *entry = selected_file_entry(active_panel);
+    const DirEntryInfo *single = active_panel->mark_count == 0 ? selected_file_entry(active_panel) : NULL;
 
-    if (entry != NULL) {
+    if (active_panel->mark_count > 0 || single != NULL) {
         char confirm_msg[TUI_MSG_BUFFER_SIZE];
-        snprintf(confirm_msg, sizeof(confirm_msg), "%s%s%s?", permanent ? "Permanently delete " : "Delete ",
-                 entry->name, entry->is_dir ? "/" : "");
+        if (single != NULL) {
+            snprintf(confirm_msg, sizeof(confirm_msg), "%s%s%s?", permanent ? "Permanently delete " : "Delete ",
+                     single->name, single->is_dir ? "/" : "");
+        } else {
+            snprintf(confirm_msg, sizeof(confirm_msg), "%s%zu items?", permanent ? "Permanently delete " : "Delete ",
+                     active_panel->mark_count);
+        }
 
         screen_hide_cursor();
-        if (screen_prompt_confirm(permanent ? "Permanently delete" : "Delete", confirm_msg)) {
-            char target_path[PATH_MAX];
-            if (!path_join(target_path, sizeof(target_path), active_panel->path, entry->name)) {
-                tui_show_popup("Error", "Path too long");
-            } else {
-                if (permanent) {
-                    fileops_delete(target_path, &tui_fileop_callbacks);
-                } else {
-                    fileops_trash(target_path, &tui_fileop_callbacks);
-                }
-                /* See comment in handle_copy(). */
-                input_consume_resize_flag();
-
-                reload_panel_and_twin(active_panel, other_panel);
-            }
-        }
+        int confirmed = screen_prompt_confirm(permanent ? "Permanently delete" : "Delete", confirm_msg);
         screen_show_cursor();
+
+        Targets targets;
+        if (confirmed && collect_targets(active_panel, &targets)) {
+            run_batch(permanent ? BATCH_DELETE : BATCH_TRASH, active_panel, &targets, NULL);
+            reload_panel_and_twin(active_panel, other_panel);
+        }
     }
 
     redraw_ui(app);
 }
 
-/* F9: restores the single most-recently-trashed item (see
- * fileops_restore_last_trashed()) - not a general undo of copy/move, and
- * not a trash browser. Reloads both panels since the restored item's
+/* F9: restores the last trash batch of this session, or the single most
+ * recently trashed item (see batch_undo()) - not an undo of copy/move,
+ * and not a trash browser. Reloads both panels since the restored items'
  * original directory may be either one, or neither. */
 static void handle_undo(App *app)
 {
-    char restored_path[PATH_MAX] = "";
-    if (fileops_restore_last_trashed(&tui_fileop_callbacks, restored_path, sizeof(restored_path))) {
-        /* Sized for a full PATH_MAX restored_path, not
-         * TUI_MSG_BUFFER_SIZE. */
-        char msg[PATH_MAX + 32];
-        snprintf(msg, sizeof(msg), "Restored: %s", restored_path);
+    /* Sized for a full PATH_MAX path, not TUI_MSG_BUFFER_SIZE. */
+    char msg[PATH_MAX + 32];
+    batch_undo(&tui_fileop_callbacks, msg, sizeof(msg));
+    if (msg[0] != '\0') {
         tui_show_popup("Undo", msg);
     }
     input_consume_resize_flag();
     panel_reload(&app->left);
     panel_reload(&app->right);
+    redraw_ui(app);
+}
+
+/* Space (with an empty command line) and Insert: mark or unmark the
+ * highlighted entry and step down, so holding the key marks a run. */
+static void handle_toggle_mark(App *app)
+{
+    Panel *active_panel = app_active_panel(app);
+    if (active_panel->count == 0) {
+        return;
+    }
+    panel_toggle_mark(active_panel, (size_t)active_panel->selected_index);
+
+    Layout layout;
+    compute_layout(&layout);
+    panel_move_selection(active_panel, 1, panel_visible_rows(&layout));
     redraw_ui(app);
 }
 
@@ -720,6 +799,9 @@ static int dispatch_key(App *app, KeyEvent key)
     switch (key.type) {
         case KEY_F10:
             return 0;
+        case KEY_INSERT:
+            handle_toggle_mark(app);
+            break;
         case KEY_F3:
             handle_edit(app);
             break;
@@ -758,6 +840,13 @@ static int dispatch_key(App *app, KeyEvent key)
                 }
             } else if (key.ch == 127 || key.ch == 8) {
                 handle_backspace(app);
+            } else if (app->cmd_len == 0 && key.ch == ' ') {
+                /* Only with an empty command line: once a command is
+                 * being typed, Space is just a space. */
+                handle_toggle_mark(app);
+            } else if (app->cmd_len == 0 && key.ch == '*') {
+                panel_toggle_mark_all(app_active_panel(app));
+                redraw_ui(app);
             } else if ((unsigned char)key.ch >= 32) {
                 /* key.ch is a signed char; UTF-8 continuation bytes (>=0x80)
                  * are negative as char and would fail a naive "< 127" check
@@ -785,6 +874,7 @@ static void report_invalid_colors(App *app)
         {"text_color", cfg->text_color},
         {"cursor_color", cfg->cursor_color},
         {"dir_color", cfg->dir_color},
+        {"mark_color", cfg->mark_color},
     };
     char invalid_msg[256] = "";
     int any_invalid = 0;
@@ -934,6 +1024,7 @@ int main(int argc, char *argv[])
 
     panel_free(&app.left);
     panel_free(&app.right);
+    batch_forget_undo();
 
     /* No screen_clear() needed: leaving the alt screen buffer (atexit)
      * restores the previous terminal content. That also means there's no

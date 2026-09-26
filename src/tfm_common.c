@@ -157,6 +157,37 @@ size_t utf8_prev_char_len(const char *buf, size_t len)
     return len - new_len;
 }
 
+void format_size(long long bytes, char *out, size_t out_size)
+{
+    static const char *const units[] = {"B", "KB", "MB", "GB", "TB"};
+    if (bytes < 1024) {
+        snprintf(out, out_size, "%lld B", bytes < 0 ? 0 : bytes);
+        return;
+    }
+    double value = (double)bytes;
+    size_t unit = 0;
+    while (value >= 1024.0 && unit < sizeof(units) / sizeof(units[0]) - 1) {
+        value /= 1024.0;
+        unit++;
+    }
+    snprintf(out, out_size, "%.1f %s", value, units[unit]);
+}
+
+void format_mark_summary(size_t marked, size_t marked_dirs, long long bytes, char *out, size_t out_size)
+{
+    char dirs_part[32] = "";
+    if (marked_dirs > 0) {
+        snprintf(dirs_part, sizeof(dirs_part), " (%zu folder%s)", marked_dirs, marked_dirs == 1 ? "" : "s");
+    }
+    if (marked_dirs == marked) {
+        snprintf(out, out_size, "%zu marked%s", marked, dirs_part);
+        return;
+    }
+    char size[32];
+    format_size(bytes, size, sizeof(size));
+    snprintf(out, out_size, "%zu marked%s, %s", marked, dirs_part, size);
+}
+
 int shell_quote(char *out, size_t out_size, const char *str)
 {
     if (out == NULL || str == NULL || out_size < 3) {

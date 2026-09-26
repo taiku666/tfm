@@ -36,7 +36,7 @@ GUI_TARGET = $(BIN_DIR)/tfm-gui
 SRCS = $(wildcard $(SRC_DIR)/*.c)
 OBJS = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SRCS))
 
-CORE_SRCS = config.c dir.c editor.c fileops.c opener.c shell.c tfm_common.c
+CORE_SRCS = batch.c config.c dir.c editor.c fileops.c opener.c shell.c tfm_common.c
 CORE_OBJS = $(patsubst %.c,$(BUILD_DIR)/%.o,$(CORE_SRCS))
 
 GUI_SRCS = $(wildcard $(GUI_SRC_DIR)/*.c)

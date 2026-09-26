@@ -11,6 +11,7 @@ typedef struct {
     char text_color[32];          /* directory listing text color */
     char cursor_color[32];        /* selection bar color */
     char dir_color[32];           /* directory entry name color */
+    char mark_color[32];          /* marked entries and the mark summary */
     char icons[16];                /* "omarchy" (Nerd Font icons) or "off" */
     char gui_theme[16];            /* tfm-gui only: "omarchy" (take accent/
                                      * light-dark from the active Omarchy theme)

@@ -93,7 +93,9 @@ typedef enum {
     SCREEN_CHOICE_SKIP,
     SCREEN_CHOICE_RETRY,
     SCREEN_CHOICE_ABORT,
-    SCREEN_CHOICE_OVERWRITE
+    SCREEN_CHOICE_OVERWRITE,
+    SCREEN_CHOICE_OVERWRITE_ALL,
+    SCREEN_CHOICE_SKIP_ALL
 } ScreenChoice;
 
 /* Shows an error popup with three options (Skip/Retry/Abort) and blocks
@@ -101,8 +103,10 @@ typedef enum {
 ScreenChoice screen_prompt_choice(const char *title, const char *message);
 
 /* Shows a popup when a target file/folder already exists, with
- * Skip/Overwrite/Abort options (S/O/A). */
-ScreenChoice screen_prompt_overwrite(const char *path);
+ * Skip/Overwrite/Abort options (S/O/A). With offer_all, "Skip all" and
+ * "Overwrite all" are offered too, for conflicts in a file operation that
+ * may hit several. */
+ScreenChoice screen_prompt_overwrite(const char *path, int offer_all);
 
 /* Shows a text-input popup with title. buffer holds the prefilled text on
  * entry (e.g. the current filename) and is replaced with the edited text

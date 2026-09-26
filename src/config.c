@@ -54,6 +54,7 @@ void config_set_defaults(Config *cfg)
     snprintf(cfg->text_color, sizeof(cfg->text_color), "system");
     snprintf(cfg->cursor_color, sizeof(cfg->cursor_color), "system");
     snprintf(cfg->dir_color, sizeof(cfg->dir_color), "blue");
+    snprintf(cfg->mark_color, sizeof(cfg->mark_color), "yellow");
     snprintf(cfg->icons, sizeof(cfg->icons), "omarchy");
     snprintf(cfg->gui_theme, sizeof(cfg->gui_theme), "omarchy");
 }
@@ -221,6 +222,8 @@ void config_load(Config *cfg, char *error_msg, size_t error_msg_size)
                 snprintf(cfg->cursor_color, sizeof(cfg->cursor_color), "%s", value);
             } else if (strcmp(key, "dir_color") == 0) {
                 snprintf(cfg->dir_color, sizeof(cfg->dir_color), "%s", value);
+            } else if (strcmp(key, "mark_color") == 0) {
+                snprintf(cfg->mark_color, sizeof(cfg->mark_color), "%s", value);
             } else if (strcmp(key, "icons") == 0) {
                 snprintf(cfg->icons, sizeof(cfg->icons), "%s", value);
             } else if (strcmp(key, "gui_theme") == 0) {
@@ -318,6 +321,7 @@ void config_save(const Config *cfg, char *error_msg, size_t error_msg_size)
     WRITE_KV("text_color", cfg->text_color);
     WRITE_KV("cursor_color", cfg->cursor_color);
     WRITE_KV("dir_color", cfg->dir_color);
+    WRITE_KV("mark_color", cfg->mark_color);
     WRITE_KV("icons", cfg->icons);
     WRITE_KV("gui_theme", cfg->gui_theme);
 

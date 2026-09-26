@@ -55,7 +55,16 @@ static FileOpChoice report_overwrite(const FileOpCallbacks *cb, const char *path
     if (cb == NULL || cb->on_overwrite == NULL) {
         return FILEOPS_CHOICE_ABORT;
     }
-    return cb->on_overwrite(cb->ctx, path);
+    FileOpChoice choice = cb->on_overwrite(cb->ctx, path);
+    /* The "all" part is the caller's to remember (batch.c); for this one
+     * conflict they mean the same as the plain answers. */
+    if (choice == FILEOPS_CHOICE_OVERWRITE_ALL) {
+        return FILEOPS_CHOICE_OVERWRITE;
+    }
+    if (choice == FILEOPS_CHOICE_SKIP_ALL) {
+        return FILEOPS_CHOICE_SKIP;
+    }
+    return choice;
 }
 
 static void report_progress(const FileOpCallbacks *cb, const char *title, const char *item, double percent)
@@ -1278,17 +1287,18 @@ static void percent_decode_path(const char *in, char *out, size_t out_size)
     out[o] = '\0';
 }
 
-void fileops_trash(const char *path, const FileOpCallbacks *cb)
+int fileops_trash(const char *path, const FileOpCallbacks *cb, char *trash_name_out,
+                  size_t trash_name_out_size)
 {
     if (is_unsafe_root_path(path)) {
         report_error(cb, "Error", "Refusing to trash this path");
-        return;
+        return 0;
     }
 
     char normalized[PATH_MAX];
     if ((size_t)snprintf(normalized, sizeof(normalized), "%s", path) >= sizeof(normalized)) {
         report_error(cb, "Path too long", path);
-        return;
+        return 0;
     }
     strip_trailing_slashes(normalized);
     path = normalized;
@@ -1297,7 +1307,7 @@ void fileops_trash(const char *path, const FileOpCallbacks *cb)
     base = (base != NULL) ? base + 1 : path;
     if (base[0] == '\0') {
         report_error(cb, "Error", "Refusing to trash this path");
-        return;
+        return 0;
     }
 
     /* The original location is recorded in the .trashinfo metadata so
@@ -1309,26 +1319,26 @@ void fileops_trash(const char *path, const FileOpCallbacks *cb)
     if (path[0] == '/') {
         if ((size_t)snprintf(abs_path, sizeof(abs_path), "%s", path) >= sizeof(abs_path)) {
             report_error(cb, "Path too long", path);
-            return;
+            return 0;
         }
     } else {
         char cwd[PATH_MAX];
         if (getcwd(cwd, sizeof(cwd)) == NULL || !path_join(abs_path, sizeof(abs_path), cwd, path)) {
             report_error(cb, "Error", "Could not resolve the absolute path to trash");
-            return;
+            return 0;
         }
     }
 
     char files_dir[PATH_MAX], info_dir[PATH_MAX];
     if (!get_trash_dirs(files_dir, sizeof(files_dir), info_dir, sizeof(info_dir))) {
         report_error(cb, "Error", "Could not access or create the trash directory");
-        return;
+        return 0;
     }
 
     char trash_name[PATH_MAX];
     if (!unique_trash_name(files_dir, info_dir, base, trash_name, sizeof(trash_name))) {
         report_error(cb, "Error", "Could not find a free name in the trash");
-        return;
+        return 0;
     }
 
     char dest[PATH_MAX], info_path[PATH_MAX];
@@ -1336,11 +1346,11 @@ void fileops_trash(const char *path, const FileOpCallbacks *cb)
         (size_t)snprintf(info_path, sizeof(info_path), "%s/%s.trashinfo", info_dir, trash_name) >=
             sizeof(info_path)) {
         report_error(cb, "Path too long", trash_name);
-        return;
+        return 0;
     }
 
     if (!move_to_exact_dest(path, dest, cb)) {
-        return;
+        return 0;
     }
 
     /* Metadata is written AFTER the move succeeds: if this fails (e.g.
@@ -1361,70 +1371,20 @@ void fileops_trash(const char *path, const FileOpCallbacks *cb)
         fprintf(fp, "[Trash Info]\nPath=%s\nDeletionDate=%s\n", encoded, timestamp);
         fclose(fp);
     }
+
+    if (trash_name_out != NULL) {
+        snprintf(trash_name_out, trash_name_out_size, "%s", trash_name);
+    }
+    return 1;
 }
 
-int fileops_restore_last_trashed(const FileOpCallbacks *cb, char *restored_path_out,
-                                  size_t restored_path_out_size)
+/* Moves files_dir/item_name back to the original path recorded in
+ * info_dir/item_name.trashinfo, then removes that metadata. Shared by
+ * fileops_restore_last_trashed() and fileops_restore_trashed(). */
+static int restore_trash_item(const char *files_dir, const char *info_dir, const char *item_name,
+                              const FileOpCallbacks *cb, char *restored_path_out,
+                              size_t restored_path_out_size)
 {
-    char files_dir[PATH_MAX], info_dir[PATH_MAX];
-    if (!get_trash_dirs(files_dir, sizeof(files_dir), info_dir, sizeof(info_dir))) {
-        report_error(cb, "Error", "Could not access the trash directory");
-        return 0;
-    }
-
-    DIR *dp = opendir(info_dir);
-    if (dp == NULL) {
-        report_error(cb, "Nothing to undo", "The trash is empty.");
-        return 0;
-    }
-
-    /* Finds the *.trashinfo file with the newest mtime - fileops_trash()
-     * writes it at deletion time, so no DeletionDate parsing is needed. */
-    static const char trashinfo_suffix[] = ".trashinfo";
-    char newest_name[PATH_MAX] = "";
-    time_t newest_mtime = 0;
-    struct dirent *entry;
-    /* errno reset before every readdir(), as in copy_recursive_impl(), so
-     * a mid-scan error (e.g. EIO) is told apart from EOF instead of
-     * silently reporting "trash is empty". */
-    while ((errno = 0, entry = readdir(dp)) != NULL) {
-        size_t name_len = strlen(entry->d_name);
-        size_t suffix_len = sizeof(trashinfo_suffix) - 1;
-        if (name_len <= suffix_len ||
-            strcmp(entry->d_name + name_len - suffix_len, trashinfo_suffix) != 0) {
-            continue;
-        }
-        char full[PATH_MAX];
-        if (!path_join(full, sizeof(full), info_dir, entry->d_name)) {
-            continue;
-        }
-        struct stat st;
-        if (stat(full, &st) != 0) {
-            continue;
-        }
-        if (newest_name[0] == '\0' || st.st_mtime > newest_mtime) {
-            newest_mtime = st.st_mtime;
-            snprintf(newest_name, sizeof(newest_name), "%s", entry->d_name);
-        }
-    }
-    if (errno != 0) {
-        report_error(cb, "Error reading trash", strerror(errno));
-        closedir(dp);
-        return 0;
-    }
-    closedir(dp);
-
-    if (newest_name[0] == '\0') {
-        report_error(cb, "Nothing to undo", "The trash is empty.");
-        return 0;
-    }
-
-    /* Strips ".trashinfo" to recover the trash item's own name - matches
-     * files/<name> exactly (see unique_trash_name()'s comment). */
-    size_t item_name_len = strlen(newest_name) - (sizeof(trashinfo_suffix) - 1);
-    char item_name[PATH_MAX];
-    snprintf(item_name, sizeof(item_name), "%.*s", (int)item_name_len, newest_name);
-
     char info_path[PATH_MAX];
     if ((size_t)snprintf(info_path, sizeof(info_path), "%s/%s.trashinfo", info_dir, item_name) >=
         sizeof(info_path)) {
@@ -1484,6 +1444,92 @@ int fileops_restore_last_trashed(const FileOpCallbacks *cb, char *restored_path_
         snprintf(restored_path_out, restored_path_out_size, "%s", original_path);
     }
     return 1;
+}
+
+int fileops_restore_last_trashed(const FileOpCallbacks *cb, char *restored_path_out,
+                                  size_t restored_path_out_size)
+{
+    char files_dir[PATH_MAX], info_dir[PATH_MAX];
+    if (!get_trash_dirs(files_dir, sizeof(files_dir), info_dir, sizeof(info_dir))) {
+        report_error(cb, "Error", "Could not access the trash directory");
+        return 0;
+    }
+
+    DIR *dp = opendir(info_dir);
+    if (dp == NULL) {
+        report_error(cb, "Nothing to undo", "The trash is empty.");
+        return 0;
+    }
+
+    /* Finds the *.trashinfo file with the newest mtime - fileops_trash()
+     * writes it at deletion time, so no DeletionDate parsing is needed. */
+    static const char trashinfo_suffix[] = ".trashinfo";
+    char newest_name[PATH_MAX] = "";
+    struct timespec newest_mtime = {0, 0};
+    struct dirent *entry;
+    /* errno reset before every readdir(), as in copy_recursive_impl(), so
+     * a mid-scan error (e.g. EIO) is told apart from EOF instead of
+     * silently reporting "trash is empty". */
+    while ((errno = 0, entry = readdir(dp)) != NULL) {
+        size_t name_len = strlen(entry->d_name);
+        size_t suffix_len = sizeof(trashinfo_suffix) - 1;
+        if (name_len <= suffix_len ||
+            strcmp(entry->d_name + name_len - suffix_len, trashinfo_suffix) != 0) {
+            continue;
+        }
+        char full[PATH_MAX];
+        if (!path_join(full, sizeof(full), info_dir, entry->d_name)) {
+            continue;
+        }
+        struct stat st;
+        if (stat(full, &st) != 0) {
+            continue;
+        }
+        /* Nanoseconds, not just st_mtime: a batch trashes several items
+         * within the same second, and the newest must still win. */
+        if (newest_name[0] == '\0' || st.st_mtim.tv_sec > newest_mtime.tv_sec ||
+            (st.st_mtim.tv_sec == newest_mtime.tv_sec && st.st_mtim.tv_nsec > newest_mtime.tv_nsec)) {
+            newest_mtime = st.st_mtim;
+            snprintf(newest_name, sizeof(newest_name), "%s", entry->d_name);
+        }
+    }
+    if (errno != 0) {
+        report_error(cb, "Error reading trash", strerror(errno));
+        closedir(dp);
+        return 0;
+    }
+    closedir(dp);
+
+    if (newest_name[0] == '\0') {
+        report_error(cb, "Nothing to undo", "The trash is empty.");
+        return 0;
+    }
+
+    /* Strips ".trashinfo" to recover the trash item's own name - matches
+     * files/<name> exactly (see unique_trash_name()'s comment). */
+    size_t item_name_len = strlen(newest_name) - (sizeof(trashinfo_suffix) - 1);
+    char item_name[PATH_MAX];
+    snprintf(item_name, sizeof(item_name), "%.*s", (int)item_name_len, newest_name);
+
+    return restore_trash_item(files_dir, info_dir, item_name, cb, restored_path_out, restored_path_out_size);
+}
+
+int fileops_restore_trashed(const char *trash_name, const FileOpCallbacks *cb, char *restored_path_out,
+                            size_t restored_path_out_size)
+{
+    /* A trash name is a single component; anything else would reach
+     * outside files/ and info/. */
+    if (!is_safe_path_component(trash_name)) {
+        report_error(cb, "Error", "Invalid trash item name");
+        return 0;
+    }
+
+    char files_dir[PATH_MAX], info_dir[PATH_MAX];
+    if (!get_trash_dirs(files_dir, sizeof(files_dir), info_dir, sizeof(info_dir))) {
+        report_error(cb, "Error", "Could not access the trash directory");
+        return 0;
+    }
+    return restore_trash_item(files_dir, info_dir, trash_name, cb, restored_path_out, restored_path_out_size);
 }
 
 void fileops_delete(const char *path, const FileOpCallbacks *cb)

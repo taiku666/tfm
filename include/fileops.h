@@ -11,7 +11,12 @@ typedef enum {
     FILEOPS_CHOICE_SKIP,
     FILEOPS_CHOICE_RETRY,
     FILEOPS_CHOICE_ABORT,
-    FILEOPS_CHOICE_OVERWRITE
+    FILEOPS_CHOICE_OVERWRITE,
+    /* on_overwrite answers that also apply to every later conflict in the
+     * same batch (see batch.h). fileops.c itself treats them as plain
+     * OVERWRITE/SKIP; remembering them is batch.c's job. */
+    FILEOPS_CHOICE_OVERWRITE_ALL,
+    FILEOPS_CHOICE_SKIP_ALL
 } FileOpChoice;
 
 /* Callbacks provided by the caller. ctx is passed through unchanged to
@@ -19,7 +24,8 @@ typedef enum {
 typedef struct {
     /* Error popup with skip/retry/abort. */
     FileOpChoice (*on_error)(void *ctx, const char *title, const char *message);
-    /* Destination already exists: skip/overwrite/abort. */
+    /* Destination already exists: skip/overwrite/abort, or skip/overwrite
+     * all. */
     FileOpChoice (*on_overwrite)(void *ctx, const char *path);
     /* Progress display (0-100); item is e.g. the file currently being
      * processed. May be NULL if no progress display is wanted. */
@@ -47,13 +53,16 @@ void fileops_delete(const char *path, const FileOpCallbacks *cb);
 
 /* Moves path (file or directory) to the freedesktop.org "home trash"
  * ($XDG_DATA_HOME/Trash, falling back to ~/.local/share/Trash) -
- * recoverable via fileops_restore_last_trashed() and by other
- * trash-spec-aware file managers. Reports errors via cb like
+ * recoverable via fileops_restore_trashed()/fileops_restore_last_trashed()
+ * and by other trash-spec-aware file managers. Reports errors via cb like
  * fileops_delete(); the caller shows its own confirmation. Only the home
  * trash is implemented, not per-mount $topdir/.Trash-$uid: trashing from
  * another filesystem works via copy-then-delete but isn't fully
- * spec-compliant. */
-void fileops_trash(const char *path, const FileOpCallbacks *cb);
+ * spec-compliant. Returns 1 on success and writes the item's name inside
+ * the trash into trash_name_out (if non-NULL) - it differs from the
+ * original name when " (1)" etc. was appended to avoid a collision. */
+int fileops_trash(const char *path, const FileOpCallbacks *cb, char *trash_name_out,
+                  size_t trash_name_out_size);
 
 /* Restores the single most-recently-trashed item to its original
  * location - "undo my last delete", not a trash browser. Never
@@ -63,5 +72,11 @@ void fileops_trash(const char *path, const FileOpCallbacks *cb);
  * non-NULL) and returns 1; returns 0 on any failure. */
 int fileops_restore_last_trashed(const FileOpCallbacks *cb, char *restored_path_out,
                                   size_t restored_path_out_size);
+
+/* Restores the trash item named trash_name (as reported by
+ * fileops_trash()) to its original location, with the same never-
+ * overwrite rules and return convention as fileops_restore_last_trashed(). */
+int fileops_restore_trashed(const char *trash_name, const FileOpCallbacks *cb, char *restored_path_out,
+                            size_t restored_path_out_size);
 
 #endif

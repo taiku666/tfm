@@ -33,6 +33,10 @@ follows your Omarchy theme automatically.
   (the same `mimeapps.list` defaults as GNOME Files/Dolphin, via GIO), so
   pictures open in your image viewer and PDFs in your PDF reader.
 - **F3 edits any file** in `$EDITOR`.
+- **Multi-select** — Space (with an empty command line) or Insert marks
+  files and folders, `*` marks all; F5/F6/F8 then act on everything
+  marked, with one confirmation, one progress bar, and "Skip all" /
+  "Overwrite all" on conflicts. F9 restores a whole deleted batch.
 - **Command shell bar**, with `cd` support in both front-ends.
 - **Persisted configuration** (`tfm.ini`): last-visited directory per panel,
   restored on startup.

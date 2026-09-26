@@ -5,6 +5,22 @@ Versioned via `TFM_VERSION` in `include/tfm_common.h` and git tags
 
 ## Unreleased
 
+- **Multi-select (TUI and GUI).** Space (TUI: only with an empty `$`
+  line, so it stays a space in commands) and Insert mark or unmark the
+  highlighted entry and move down; `*` marks everything except `..`, or
+  clears all marks if everything is already marked. F5 Copy, F6 Move and
+  F8 Delete act on all marked items, or on the highlighted one if none
+  are marked; Enter, F3 and same-folder rename stay single-item. Marked
+  entries show a `*` (TUI, color set by the new `mark_color` in
+  `tfm.ini`) or a check mark (GUI), with a "3 marked (1 folder),
+  12.4 MB" summary. Marks survive reloads of the same folder, are
+  cleared when leaving it, and after a completed operation - an aborted
+  one keeps them for a retry.
+- Batches confirm once ("Delete 5 items?"), show one progress bar
+  across all items, stop entirely on Abort, and the overwrite prompt
+  offers "Skip all" and "Overwrite all" - also for conflicts inside a
+  single copied folder. F9 restores the whole last deleted batch; after a
+  restart it falls back to restoring items one at a time, newest first.
 - Commands typed into the TUI's `$` line now keep their output on screen
   until a key is pressed, like programs started with Enter, instead of
   it being wiped by the redraw right away. `cd` is unaffected.

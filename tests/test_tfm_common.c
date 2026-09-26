@@ -351,6 +351,35 @@ TEST(shell_quote_null_args)
     ASSERT_EQ(shell_quote(out, 2, ""), 0);
 }
 
+/* --- format_size / format_mark_summary --------------------------------- */
+
+TEST(format_size_units)
+{
+    char out[32];
+    format_size(0, out, sizeof(out));
+    ASSERT_STR_EQ(out, "0 B");
+    format_size(1023, out, sizeof(out));
+    ASSERT_STR_EQ(out, "1023 B");
+    format_size(1536, out, sizeof(out));
+    ASSERT_STR_EQ(out, "1.5 KB");
+    format_size(13002342, out, sizeof(out));
+    ASSERT_STR_EQ(out, "12.4 MB");
+    format_size(3LL * 1024 * 1024 * 1024, out, sizeof(out));
+    ASSERT_STR_EQ(out, "3.0 GB");
+}
+
+TEST(format_mark_summary_variants)
+{
+    char out[64];
+    format_mark_summary(3, 1, 13002342, out, sizeof(out));
+    ASSERT_STR_EQ(out, "3 marked (1 folder), 12.4 MB");
+    format_mark_summary(2, 0, 2048, out, sizeof(out));
+    ASSERT_STR_EQ(out, "2 marked, 2.0 KB");
+    /* Only folders: their size is unknown, so none is shown. */
+    format_mark_summary(2, 2, 0, out, sizeof(out));
+    ASSERT_STR_EQ(out, "2 marked (2 folders)");
+}
+
 int main(void)
 {
     TFM_RUN(path_join_basic);
@@ -378,5 +407,7 @@ int main(void)
     TFM_RUN(shell_quote_round_trips_through_real_shell);
     TFM_RUN(shell_quote_exact_fit_and_truncation);
     TFM_RUN(shell_quote_null_args);
+    TFM_RUN(format_size_units);
+    TFM_RUN(format_mark_summary_variants);
     return TFM_SUMMARY();
 }

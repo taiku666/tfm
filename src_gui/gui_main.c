@@ -23,6 +23,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "batch.h"
 #include "config.h"
 #include "dir.h"
 #include "omarchy_theme.h"
@@ -45,9 +46,17 @@ struct _TfmFileItem {
     GObject parent_instance;
     char *name;
     int is_dir;
+    gboolean marked;
+    gint64 marked_size; /* lstat size when marked; files only */
 };
 
 G_DEFINE_TYPE(TfmFileItem, tfm_file_item, G_TYPE_OBJECT)
+
+/* "marked" is a read-only property purely for its notify signal: a bound
+ * row listens to it and restyles itself, so toggling a mark never has to
+ * rebuild the store (which would reset selection and scrolling). */
+enum { FILE_ITEM_PROP_MARKED = 1, FILE_ITEM_N_PROPS };
+static GParamSpec *file_item_props[FILE_ITEM_N_PROPS];
 
 static void tfm_file_item_finalize(GObject *obj)
 {
@@ -56,9 +65,33 @@ static void tfm_file_item_finalize(GObject *obj)
     G_OBJECT_CLASS(tfm_file_item_parent_class)->finalize(obj);
 }
 
+static void tfm_file_item_get_property(GObject *obj, guint prop_id, GValue *value, GParamSpec *pspec)
+{
+    if (prop_id == FILE_ITEM_PROP_MARKED) {
+        g_value_set_boolean(value, TFM_FILE_ITEM(obj)->marked);
+    } else {
+        G_OBJECT_WARN_INVALID_PROPERTY_ID(obj, prop_id, pspec);
+    }
+}
+
 static void tfm_file_item_class_init(TfmFileItemClass *klass)
 {
-    G_OBJECT_CLASS(klass)->finalize = tfm_file_item_finalize;
+    GObjectClass *object_class = G_OBJECT_CLASS(klass);
+    object_class->finalize = tfm_file_item_finalize;
+    object_class->get_property = tfm_file_item_get_property;
+    file_item_props[FILE_ITEM_PROP_MARKED] =
+        g_param_spec_boolean("marked", NULL, NULL, FALSE, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS);
+    g_object_class_install_properties(object_class, FILE_ITEM_N_PROPS, file_item_props);
+}
+
+static void tfm_file_item_set_marked(TfmFileItem *self, gboolean marked, gint64 size)
+{
+    if (self->marked == marked) {
+        return;
+    }
+    self->marked = marked;
+    self->marked_size = marked ? size : 0;
+    g_object_notify_by_pspec(G_OBJECT(self), file_item_props[FILE_ITEM_PROP_MARKED]);
 }
 
 static void tfm_file_item_init(TfmFileItem *self)
@@ -79,6 +112,7 @@ typedef struct {
     char path[PATH_MAX];
     GListStore *store;
     GtkWidget *path_label;
+    GtkWidget *mark_label; /* "3 marked (1 folder), 12.4 MB", hidden when none */
     GtkWidget *list_view;
     GtkWidget *container; /* carries the "active panel" border, see focus_panel() */
 } GuiPanel;
@@ -142,6 +176,47 @@ static char g_pending_panel_load_error[2][PATH_MAX * 2 + 64];
  * there is no window at all yet to parent a blocking dialog to. */
 static char g_pending_config_load_error[PATH_MAX + 64];
 
+/* Refreshes panel's "3 marked (1 folder), 12.4 MB" label from its store,
+ * hiding it when nothing is marked. */
+static void gui_update_mark_label(GuiPanel *panel)
+{
+    if (panel->mark_label == NULL) {
+        return;
+    }
+    size_t marked = 0, marked_dirs = 0;
+    long long bytes = 0;
+    guint n = g_list_model_get_n_items(G_LIST_MODEL(panel->store));
+    for (guint i = 0; i < n; i++) {
+        TfmFileItem *item = g_list_model_get_item(G_LIST_MODEL(panel->store), i);
+        if (item->marked) {
+            marked++;
+            marked_dirs += item->is_dir ? 1 : 0;
+            bytes += item->marked_size;
+        }
+        g_object_unref(item);
+    }
+    if (marked == 0) {
+        gtk_widget_set_visible(panel->mark_label, FALSE);
+        return;
+    }
+    char summary[96];
+    format_mark_summary(marked, marked_dirs, bytes, summary, sizeof(summary));
+    gtk_label_set_label(GTK_LABEL(panel->mark_label), summary);
+    gtk_widget_set_visible(panel->mark_label, TRUE);
+}
+
+/* lstat size of a file about to be marked (a symlink counts as itself);
+ * folders count 0, see format_mark_summary(). */
+static gint64 gui_item_size(const GuiPanel *panel, const TfmFileItem *item)
+{
+    char path[PATH_MAX];
+    struct stat st;
+    if (item->is_dir || !path_join(path, sizeof(path), panel->path, item->name) || lstat(path, &st) != 0) {
+        return 0;
+    }
+    return (gint64)st.st_size;
+}
+
 /* Loads path into panel. A failed reload keeps the old listing, like the
  * TUI's panel_reload(). A failed *initial* load (panel->path still empty)
  * falls back to $HOME, then "/", and queues an error in
@@ -188,11 +263,32 @@ static int panel_load_indexed(GuiPanel *panel, const char *path, int panel_index
         }
     }
 
+    /* Marks survive a reload of the same folder, by name, and are dropped
+     * when the panel moves to another one - same rules as the TUI's
+     * panel_reload()/panel_change_dir(). */
+    GHashTable *marked_names = NULL;
+    if (strcmp(path, panel->path) == 0) {
+        guint n = g_list_model_get_n_items(G_LIST_MODEL(panel->store));
+        for (guint i = 0; i < n; i++) {
+            TfmFileItem *old_item = g_list_model_get_item(G_LIST_MODEL(panel->store), i);
+            if (old_item->marked) {
+                if (marked_names == NULL) {
+                    marked_names = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+                }
+                g_hash_table_add(marked_names, g_strdup(old_item->name));
+            }
+            g_object_unref(old_item);
+        }
+    }
+
     g_list_store_remove_all(panel->store);
     guint restore_index = 0;
     gboolean restore_found = FALSE;
     for (size_t i = 0; i < count; i++) {
         TfmFileItem *item = tfm_file_item_new(entries[i].name, entries[i].is_dir);
+        if (marked_names != NULL && g_hash_table_contains(marked_names, entries[i].name)) {
+            tfm_file_item_set_marked(item, TRUE, gui_item_size(panel, item));
+        }
         g_list_store_append(panel->store, item);
         g_object_unref(item);
 
@@ -202,6 +298,9 @@ static int panel_load_indexed(GuiPanel *panel, const char *path, int panel_index
         }
     }
     dir_list_free(entries);
+    if (marked_names != NULL) {
+        g_hash_table_destroy(marked_names);
+    }
 
     /* old_model is still valid: remove_all()/append() mutate the store in
      * place. Re-select by name, or the top entry if that item is gone. */
@@ -221,6 +320,7 @@ static int panel_load_indexed(GuiPanel *panel, const char *path, int panel_index
     if (panel->path_label != NULL) {
         gtk_label_set_label(GTK_LABEL(panel->path_label), panel->path);
     }
+    gui_update_mark_label(panel);
     return 1;
 }
 
@@ -449,6 +549,27 @@ static void on_factory_setup(GtkSignalListItemFactory *factory, GtkListItem *lis
     gtk_list_item_set_child(list_item, box);
 }
 
+/* Shows a marked item as "✓ name" in the .tfm-marked style (bold accent,
+ * see apply_base_css()). */
+static void update_row_mark(GtkListItem *list_item)
+{
+    TfmFileItem *item = TFM_FILE_ITEM(gtk_list_item_get_item(list_item));
+    GtkWidget *box = gtk_list_item_get_child(list_item);
+    if (item == NULL || box == NULL) {
+        return;
+    }
+    GtkWidget *label = gtk_widget_get_next_sibling(gtk_widget_get_first_child(box));
+    if (item->marked) {
+        char *text = g_strdup_printf("\u2713 %s", item->name);
+        gtk_label_set_label(GTK_LABEL(label), text);
+        g_free(text);
+        gtk_widget_add_css_class(box, "tfm-marked");
+    } else {
+        gtk_label_set_label(GTK_LABEL(label), item->name);
+        gtk_widget_remove_css_class(box, "tfm-marked");
+    }
+}
+
 static void on_factory_bind(GtkSignalListItemFactory *factory, GtkListItem *list_item,
                              gpointer user_data)
 {
@@ -457,11 +578,27 @@ static void on_factory_bind(GtkSignalListItemFactory *factory, GtkListItem *list
     TfmFileItem *item = TFM_FILE_ITEM(gtk_list_item_get_item(list_item));
     GtkWidget *box = gtk_list_item_get_child(list_item);
     GtkWidget *icon = gtk_widget_get_first_child(box);
-    GtkWidget *label = gtk_widget_get_next_sibling(icon);
 
     gtk_image_set_from_icon_name(GTK_IMAGE(icon),
                                   item->is_dir ? "folder-symbolic" : "text-x-generic-symbolic");
-    gtk_label_set_label(GTK_LABEL(label), item->name);
+    update_row_mark(list_item);
+    gulong handler = g_signal_connect_swapped(item, "notify::marked", G_CALLBACK(update_row_mark), list_item);
+    g_object_set_data(G_OBJECT(list_item), "tfm-mark-handler", GUINT_TO_POINTER(handler));
+}
+
+/* Rows are recycled for other items, so the notify::marked connection
+ * made in bind must go when the row lets go of this item. */
+static void on_factory_unbind(GtkSignalListItemFactory *factory, GtkListItem *list_item,
+                               gpointer user_data)
+{
+    (void)factory;
+    (void)user_data;
+    gulong handler = GPOINTER_TO_UINT(g_object_get_data(G_OBJECT(list_item), "tfm-mark-handler"));
+    GObject *item = gtk_list_item_get_item(list_item);
+    if (handler != 0 && item != NULL) {
+        g_signal_handler_disconnect(item, handler);
+    }
+    g_object_set_data(G_OBJECT(list_item), "tfm-mark-handler", NULL);
 }
 
 /* Pumps pending GTK events while editor_open_cb() waits on the external
@@ -596,11 +733,20 @@ static GtkWidget *build_panel_widget(GuiPanel *panel, const char *initial_path)
     gtk_widget_set_margin_top(panel->path_label, 8);
     gtk_widget_set_margin_bottom(panel->path_label, 4);
 
+    panel->mark_label = gtk_label_new(NULL);
+    gtk_label_set_xalign(GTK_LABEL(panel->mark_label), 0.0f);
+    gtk_widget_add_css_class(panel->mark_label, "tfm-mark-summary");
+    gtk_widget_add_css_class(panel->mark_label, "tfm-mono");
+    gtk_widget_set_margin_start(panel->mark_label, 8);
+    gtk_widget_set_margin_bottom(panel->mark_label, 4);
+    gtk_widget_set_visible(panel->mark_label, FALSE);
+
     GtkSingleSelection *selection = gtk_single_selection_new(G_LIST_MODEL(panel->store));
 
     GtkListItemFactory *factory = gtk_signal_list_item_factory_new();
     g_signal_connect(factory, "setup", G_CALLBACK(on_factory_setup), NULL);
     g_signal_connect(factory, "bind", G_CALLBACK(on_factory_bind), NULL);
+    g_signal_connect(factory, "unbind", G_CALLBACK(on_factory_unbind), NULL);
 
     panel->list_view = gtk_list_view_new(GTK_SELECTION_MODEL(selection), factory);
     gtk_widget_add_css_class(panel->list_view, "tfm-mono");
@@ -619,6 +765,7 @@ static GtkWidget *build_panel_widget(GuiPanel *panel, const char *initial_path)
 
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_box_append(GTK_BOX(box), panel->path_label);
+    gtk_box_append(GTK_BOX(box), panel->mark_label);
     gtk_box_append(GTK_BOX(box), scrolled);
     panel->container = box;
 
@@ -967,9 +1114,10 @@ static FileOpChoice gui_fileop_on_error(void *ctx, const char *title, const char
     return choice;
 }
 
-static FileOpChoice gui_fileop_on_overwrite(void *ctx, const char *path)
+/* offer_all adds "Skip all"/"Overwrite all" for conflicts in a file
+ * operation that may hit several; F6 rename asks about one file only. */
+static FileOpChoice ask_overwrite(const char *path, gboolean offer_all)
 {
-    (void)ctx;
     char message[PATH_MAX + 32];
     snprintf(message, sizeof(message), "%s already exists.", path);
 
@@ -978,18 +1126,37 @@ static FileOpChoice gui_fileop_on_overwrite(void *ctx, const char *path)
         {"overwrite", "Overwrite", ADW_RESPONSE_DESTRUCTIVE},
         {"abort", "Abort", ADW_RESPONSE_DEFAULT},
     };
-    char *response =
-        show_alert_dialog("File exists", message, responses, G_N_ELEMENTS(responses), "skip", "abort");
+    static const DialogResponse responses_all[] = {
+        {"skip", "Skip", ADW_RESPONSE_DEFAULT},
+        {"skip_all", "Skip all", ADW_RESPONSE_DEFAULT},
+        {"overwrite", "Overwrite", ADW_RESPONSE_DESTRUCTIVE},
+        {"overwrite_all", "Overwrite all", ADW_RESPONSE_DESTRUCTIVE},
+        {"abort", "Abort", ADW_RESPONSE_DEFAULT},
+    };
+    char *response = offer_all ? show_alert_dialog("File exists", message, responses_all,
+                                                   G_N_ELEMENTS(responses_all), "skip", "abort")
+                               : show_alert_dialog("File exists", message, responses,
+                                                   G_N_ELEMENTS(responses), "skip", "abort");
     FileOpChoice choice = FILEOPS_CHOICE_ABORT;
     if (response != NULL) {
         if (strcmp(response, "skip") == 0) {
             choice = FILEOPS_CHOICE_SKIP;
+        } else if (strcmp(response, "skip_all") == 0) {
+            choice = FILEOPS_CHOICE_SKIP_ALL;
         } else if (strcmp(response, "overwrite") == 0) {
             choice = FILEOPS_CHOICE_OVERWRITE;
+        } else if (strcmp(response, "overwrite_all") == 0) {
+            choice = FILEOPS_CHOICE_OVERWRITE_ALL;
         }
         g_free(response);
     }
     return choice;
+}
+
+static FileOpChoice gui_fileop_on_overwrite(void *ctx, const char *path)
+{
+    (void)ctx;
+    return ask_overwrite(path, TRUE);
 }
 
 /* Progress display (F5 Copy/F6 Move). fileops_copy()/fileops_move() run
@@ -1072,6 +1239,134 @@ static const FileOpCallbacks gui_fileop_callbacks = {
     .ctx = NULL,
 };
 
+/* Space/Insert: mark or unmark the selected entry and step down, moving
+ * keyboard focus along with the selection - GtkListView keeps the two
+ * separately, and a moved selection alone would send the next arrow key
+ * back to the old row. ".." is never marked. */
+static void action_toggle_mark(void)
+{
+    GuiPanel *active = &g_panel[g_focused_panel];
+    GtkSelectionModel *model = gtk_list_view_get_model(GTK_LIST_VIEW(active->list_view));
+    if (!GTK_IS_SINGLE_SELECTION(model)) {
+        return;
+    }
+    guint pos = gtk_single_selection_get_selected(GTK_SINGLE_SELECTION(model));
+    guint n = g_list_model_get_n_items(G_LIST_MODEL(active->store));
+    if (pos == GTK_INVALID_LIST_POSITION || pos >= n) {
+        return;
+    }
+
+    TfmFileItem *item = g_list_model_get_item(G_LIST_MODEL(active->store), pos);
+    if (strcmp(item->name, "..") != 0) {
+        tfm_file_item_set_marked(item, !item->marked, item->marked ? 0 : gui_item_size(active, item));
+        gui_update_mark_label(active);
+    }
+    g_object_unref(item);
+
+    if (pos + 1 < n) {
+        gtk_list_view_scroll_to(GTK_LIST_VIEW(active->list_view), pos + 1,
+                                GTK_LIST_SCROLL_FOCUS | GTK_LIST_SCROLL_SELECT, NULL);
+    }
+}
+
+/* Marks every entry except "..", or clears all marks if every one of them
+ * is already marked (panel_toggle_mark_all() in the TUI). */
+static void action_toggle_mark_all(void)
+{
+    GuiPanel *active = &g_panel[g_focused_panel];
+    GListModel *store = G_LIST_MODEL(active->store);
+    guint n = g_list_model_get_n_items(store);
+    gboolean all_marked = TRUE;
+    for (guint i = 0; i < n && all_marked; i++) {
+        TfmFileItem *item = g_list_model_get_item(store, i);
+        if (!item->marked && strcmp(item->name, "..") != 0) {
+            all_marked = FALSE;
+        }
+        g_object_unref(item);
+    }
+    for (guint i = 0; i < n; i++) {
+        TfmFileItem *item = g_list_model_get_item(store, i);
+        if (strcmp(item->name, "..") != 0 && item->marked == all_marked) {
+            tfm_file_item_set_marked(item, !all_marked, all_marked ? 0 : gui_item_size(active, item));
+        }
+        g_object_unref(item);
+    }
+    gui_update_mark_label(active);
+}
+
+static void gui_clear_marks(GuiPanel *panel)
+{
+    guint n = g_list_model_get_n_items(G_LIST_MODEL(panel->store));
+    for (guint i = 0; i < n; i++) {
+        TfmFileItem *item = g_list_model_get_item(G_LIST_MODEL(panel->store), i);
+        tfm_file_item_set_marked(item, FALSE, 0);
+        g_object_unref(item);
+    }
+    gui_update_mark_label(panel);
+}
+
+static guint gui_mark_count(GuiPanel *panel)
+{
+    guint marked = 0;
+    guint n = g_list_model_get_n_items(G_LIST_MODEL(panel->store));
+    for (guint i = 0; i < n; i++) {
+        TfmFileItem *item = g_list_model_get_item(G_LIST_MODEL(panel->store), i);
+        marked += item->marked ? 1 : 0;
+        g_object_unref(item);
+    }
+    return marked;
+}
+
+/* The items F5/F6/F8 act on, as full paths: every marked entry, or the
+ * selected one if nothing is marked (never ".."). Returns a NULL-
+ * terminated array for g_strfreev(), or NULL if there's nothing to act on
+ * or after reporting a failure. */
+static char **gui_collect_targets(GuiPanel *panel, guint *count_out)
+{
+    GPtrArray *paths = g_ptr_array_new_with_free_func(g_free);
+    gboolean use_marks = gui_mark_count(panel) > 0;
+    TfmFileItem *single = use_marks ? NULL : panel_get_selected_item(panel);
+    if (!use_marks && (single == NULL || strcmp(single->name, "..") == 0)) {
+        g_ptr_array_unref(paths);
+        return NULL;
+    }
+
+    guint n = g_list_model_get_n_items(G_LIST_MODEL(panel->store));
+    for (guint i = 0; i < n; i++) {
+        TfmFileItem *item = g_list_model_get_item(G_LIST_MODEL(panel->store), i);
+        gboolean wanted = use_marks ? item->marked : item == single;
+        char path[PATH_MAX];
+        if (wanted && !path_join(path, sizeof(path), panel->path, item->name)) {
+            g_object_unref(item);
+            g_ptr_array_unref(paths);
+            show_error_dialog("Error", "Path too long");
+            return NULL;
+        }
+        if (wanted) {
+            g_ptr_array_add(paths, g_strdup(path));
+        }
+        g_object_unref(item);
+    }
+
+    *count_out = paths->len;
+    g_ptr_array_add(paths, NULL);
+    return (char **)g_ptr_array_free(paths, FALSE);
+}
+
+/* Runs op over targets inside the modal bracket. Marks are cleared once
+ * the batch completes; after an abort they stay, so the user can retry. */
+static void gui_run_batch(BatchOp op, GuiPanel *source, char **targets, guint count, const char *dest_dir)
+{
+    gui_modal_enter();
+    int completed = batch_run(op, (const char *const *)targets, count, dest_dir, &gui_fileop_callbacks);
+    gui_progress_hide();
+    gui_modal_leave();
+    if (completed) {
+        gui_clear_marks(source);
+    }
+    g_strfreev(targets);
+}
+
 static void action_edit(void)
 {
     GuiPanel *active = &g_panel[g_focused_panel];
@@ -1093,35 +1388,42 @@ static void action_copy(void)
 {
     GuiPanel *active = &g_panel[g_focused_panel];
     GuiPanel *other = other_panel_of_focused();
-    TfmFileItem *item = panel_get_selected_item(active);
-    if (item == NULL || strcmp(item->name, "..") == 0) {
+    guint count = 0;
+    char **targets = gui_collect_targets(active, &count);
+    if (targets == NULL) {
         return;
     }
-    char src_path[PATH_MAX];
-    if (!path_join(src_path, sizeof(src_path), active->path, item->name)) {
-        show_error_dialog("Error", "Path too long");
-        return;
-    }
-    gui_modal_enter();
-    fileops_copy(src_path, other->path, &gui_fileop_callbacks);
-    gui_progress_hide();
-    gui_modal_leave();
+    gui_run_batch(BATCH_COPY, active, targets, count, other->path);
     panel_load(other, other->path);
     if (strcmp(active->path, other->path) == 0) {
         panel_load(active, active->path);
     }
 }
 
+/* F6: move the marked entries (or the selected one) into the other
+ * panel's directory. With both panels in the same directory it renames
+ * the selected entry instead, marks or not. */
 static void action_move(void)
 {
     GuiPanel *active = &g_panel[g_focused_panel];
     GuiPanel *other = other_panel_of_focused();
+
+    if (strcmp(active->path, other->path) != 0) {
+        guint count = 0;
+        char **targets = gui_collect_targets(active, &count);
+        if (targets != NULL) {
+            gui_run_batch(BATCH_MOVE, active, targets, count, other->path);
+            panel_load(active, active->path);
+            panel_load(other, other->path);
+        }
+        return;
+    }
+
     TfmFileItem *item = panel_get_selected_item(active);
     if (item == NULL || strcmp(item->name, "..") == 0) {
         return;
     }
-
-    if (strcmp(active->path, other->path) == 0) {
+    {
         /* Same directory in both panels: moving makes no sense, rename instead. */
         char *new_name = prompt_text_dialog("Rename", item->name);
         if (new_name != NULL) {
@@ -1145,7 +1447,7 @@ static void action_move(void)
                     /* rename() replaces an existing destination atomically
                      * and silently - mirror the TUI's F6 rename prompt
                      * (main.c) instead of losing the existing file. */
-                    if (gui_fileop_on_overwrite(NULL, new_path) != FILEOPS_CHOICE_OVERWRITE) {
+                    if (ask_overwrite(new_path, FALSE) != FILEOPS_CHOICE_OVERWRITE) {
                         confirmed = 0;
                     }
                 }
@@ -1163,18 +1465,6 @@ static void action_move(void)
             }
             g_free(new_name);
         }
-    } else {
-        char src_path[PATH_MAX];
-        if (!path_join(src_path, sizeof(src_path), active->path, item->name)) {
-            show_error_dialog("Error", "Path too long");
-            return;
-        }
-        gui_modal_enter();
-        fileops_move(src_path, other->path, &gui_fileop_callbacks);
-        gui_progress_hide();
-        gui_modal_leave();
-        panel_load(active, active->path);
-        panel_load(other, other->path);
     }
 }
 
@@ -1216,32 +1506,30 @@ static void action_delete_impl(int permanent)
 {
     GuiPanel *active = &g_panel[g_focused_panel];
     GuiPanel *other = other_panel_of_focused();
-    TfmFileItem *item = panel_get_selected_item(active);
-    if (item == NULL || strcmp(item->name, "..") == 0) {
+    guint marked = gui_mark_count(active);
+    TfmFileItem *single = marked == 0 ? panel_get_selected_item(active) : NULL;
+    if (marked == 0 && (single == NULL || strcmp(single->name, "..") == 0)) {
         return;
     }
 
     char message[300];
-    snprintf(message, sizeof(message), "%s%s%s?", permanent ? "Permanently delete " : "Delete ",
-             item->name, item->is_dir ? "/" : "");
+    if (single != NULL) {
+        snprintf(message, sizeof(message), "%s%s%s?", permanent ? "Permanently delete " : "Delete ",
+                 single->name, single->is_dir ? "/" : "");
+    } else {
+        snprintf(message, sizeof(message), "%s%u items?", permanent ? "Permanently delete " : "Delete ", marked);
+    }
     if (!confirm_dialog(permanent ? "Permanently delete" : "Delete", message,
                          permanent ? "Permanently delete" : "Delete")) {
         return;
     }
 
-    char target_path[PATH_MAX];
-    if (!path_join(target_path, sizeof(target_path), active->path, item->name)) {
-        show_error_dialog("Error", "Path too long");
+    guint count = 0;
+    char **targets = gui_collect_targets(active, &count);
+    if (targets == NULL) {
         return;
     }
-    gui_modal_enter();
-    if (permanent) {
-        fileops_delete(target_path, &gui_fileop_callbacks);
-    } else {
-        fileops_trash(target_path, &gui_fileop_callbacks);
-    }
-    gui_progress_hide();
-    gui_modal_leave();
+    gui_run_batch(permanent ? BATCH_DELETE : BATCH_TRASH, active, targets, count, NULL);
     panel_load(active, active->path);
     if (strcmp(active->path, other->path) == 0) {
         panel_load(other, other->path);
@@ -1258,22 +1546,19 @@ static void action_delete_permanent(void)
     action_delete_impl(1);
 }
 
-/* Undo: restores the single most-recently-trashed item (see
- * fileops_restore_last_trashed()) - not a general undo of copy/move.
- * Reloads both panels since the restored item's directory may be either
- * one, or neither. */
+/* Undo: restores the last trash batch of this session, or the single
+ * most recently trashed item (see batch_undo()) - not an undo of
+ * copy/move. Reloads both panels since the restored items' directory may
+ * be either one, or neither. */
 static void action_undo(void)
 {
-    char restored_path[PATH_MAX] = "";
+    char message[PATH_MAX + 32];
     gui_modal_enter();
-    int restored =
-        fileops_restore_last_trashed(&gui_fileop_callbacks, restored_path, sizeof(restored_path));
+    batch_undo(&gui_fileop_callbacks, message, sizeof(message));
     gui_progress_hide();
     gui_modal_leave();
 
-    if (restored) {
-        char message[PATH_MAX + 32];
-        snprintf(message, sizeof(message), "Restored: %s", restored_path);
+    if (message[0] != '\0') {
         show_error_dialog("Undo", message);
     }
 
@@ -1353,7 +1638,9 @@ static void apply_base_css(void)
     GtkCssProvider *provider = gtk_css_provider_new();
     gtk_css_provider_load_from_string(
         provider, ".tfm-panel-active { border: 2px solid @accent_color; padding: 3px; }\n"
-                  ".tfm-panel-active .heading { color: @accent_color; }\n");
+                  ".tfm-panel-active .heading { color: @accent_color; }\n"
+                  ".tfm-marked label { color: @accent_color; font-weight: bold; }\n"
+                  ".tfm-mark-summary { color: @accent_color; font-weight: bold; }\n");
     gtk_style_context_add_provider_for_display(display, GTK_STYLE_PROVIDER(provider),
                                                 GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
     g_object_unref(provider);
@@ -1532,6 +1819,13 @@ static void apply_font_size(void)
     gtk_css_provider_load_from_string(g_font_css_provider, css);
 }
 
+static gboolean focus_is_in_panel_list(GtkWindow *window)
+{
+    GtkWidget *focus = gtk_root_get_focus(GTK_ROOT(window));
+    GtkWidget *list = g_panel[g_focused_panel].list_view;
+    return focus != NULL && list != NULL && (focus == list || gtk_widget_is_ancestor(focus, list));
+}
+
 static gboolean on_window_key_pressed(GtkEventControllerKey *controller, guint keyval,
                                        guint keycode, GdkModifierType state, gpointer user_data)
 {
@@ -1544,6 +1838,19 @@ static gboolean on_window_key_pressed(GtkEventControllerKey *controller, guint k
      * g_modal_depth above. */
     if (g_modal_depth > 0) {
         return GDK_EVENT_PROPAGATE;
+    }
+
+    /* Marking keys only while a file list has focus: in the shell entry
+     * they are ordinary text. */
+    if (focus_is_in_panel_list(window)) {
+        if (keyval == GDK_KEY_space || keyval == GDK_KEY_Insert || keyval == GDK_KEY_KP_Insert) {
+            action_toggle_mark();
+            return GDK_EVENT_STOP;
+        }
+        if (keyval == GDK_KEY_asterisk || keyval == GDK_KEY_KP_Multiply) {
+            action_toggle_mark_all();
+            return GDK_EVENT_STOP;
+        }
     }
 
     if (keyval == GDK_KEY_Tab || keyval == GDK_KEY_ISO_Left_Tab || keyval == GDK_KEY_KP_Tab) {
@@ -1775,6 +2082,7 @@ static void on_shutdown(GApplication *app, gpointer user_data)
 {
     (void)app;
     (void)user_data;
+    batch_forget_undo();
     if (g_panel[0].path[0] != '\0') {
         snprintf(g_cfg.left_path, sizeof(g_cfg.left_path), "%s", g_panel[0].path);
     }

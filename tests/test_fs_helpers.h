@@ -39,9 +39,11 @@ static __attribute__((unused)) void make_temp_dir(char *out, size_t size)
  * content within the same function, not across a chain of them. Routing
  * through this function (dir/suffix become plain, unsized `const char *`
  * at the call site) avoids a wall of bogus warnings for concatenations
- * that are actually always well within bounds. Returns what snprintf()
- * returned, so a caller that wants to check for truncation still can. */
-static __attribute__((unused)) int join_path(char *out, size_t out_size, const char *dir, const char *suffix)
+ * that are actually always well within bounds. noinline keeps that true
+ * when the destination is a struct field: inlined, gcc sees the field's
+ * declared size again. Returns what snprintf() returned, so a caller that
+ * wants to check for truncation still can. */
+static __attribute__((unused, noinline)) int join_path(char *out, size_t out_size, const char *dir, const char *suffix)
 {
     return snprintf(out, out_size, "%s%s", dir, suffix);
 }

@@ -1,3 +1,5 @@
+#define _DEFAULT_SOURCE
+
 #include "panel.h"
 
 #include <errno.h>
@@ -5,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/stat.h>
 
 #include "screen.h"
 
@@ -84,7 +87,115 @@ void panel_init(Panel *panel, const char *path)
     panel->count = 0;
     panel->scroll_offset = 0;
     panel->selected_index = 0;
+    panel->marks = NULL;
+    panel->mark_sizes = NULL;
+    panel->mark_count = 0;
+    panel->marked_dirs = 0;
+    panel->marked_bytes = 0;
     panel_reload(panel);
+}
+
+static int is_markable(const DirEntryInfo *entry)
+{
+    return strcmp(entry->name, "..") != 0;
+}
+
+/* lstat size of a marked file: a symlink counts as the link itself,
+ * matching what a copy would write. 0 if it vanished meanwhile. */
+static long long entry_size(const Panel *panel, const DirEntryInfo *entry)
+{
+    char path[PATH_MAX];
+    struct stat st;
+    if (entry->is_dir || !path_join(path, sizeof(path), panel->path, entry->name) || lstat(path, &st) != 0) {
+        return 0;
+    }
+    return (long long)st.st_size;
+}
+
+/* Unmarking subtracts the size recorded at marking time, not a fresh
+ * lstat, so a file that changed size meanwhile can't skew the total. */
+static void add_mark_totals(Panel *panel, size_t index, int sign)
+{
+    const DirEntryInfo *entry = &panel->entries[index];
+    if (sign > 0) {
+        panel->mark_sizes[index] = entry_size(panel, entry);
+        panel->mark_count++;
+        panel->marked_dirs += entry->is_dir ? 1 : 0;
+        panel->marked_bytes += panel->mark_sizes[index];
+    } else {
+        panel->mark_count--;
+        panel->marked_dirs -= entry->is_dir ? 1 : 0;
+        panel->marked_bytes -= panel->mark_sizes[index];
+    }
+}
+
+static int compare_names(const void *a, const void *b)
+{
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+/* Replaces panel's listing with entries/count (taking ownership). With
+ * keep_marks, entries whose name was marked before stay marked - looked
+ * up in a sorted copy of the old marked names, so re-marking stays
+ * O(n log m) even with thousands of marks. */
+static void panel_set_listing(Panel *panel, DirEntryInfo *entries, size_t count, int keep_marks)
+{
+    const char **old_marked = NULL;
+    size_t old_marked_count = 0;
+    if (keep_marks && panel->marks != NULL && panel->mark_count > 0) {
+        old_marked = malloc(panel->mark_count * sizeof(*old_marked));
+        if (old_marked != NULL) {
+            for (size_t i = 0; i < panel->count; i++) {
+                if (panel->marks[i]) {
+                    old_marked[old_marked_count++] = panel->entries[i].name;
+                }
+            }
+            qsort(old_marked, old_marked_count, sizeof(*old_marked), compare_names);
+        }
+    }
+
+    /* calloc(0) may return NULL, which would read as "allocation
+     * failed" - size them for at least one entry. */
+    unsigned char *marks = calloc(count > 0 ? count : 1, 1);
+    long long *mark_sizes = calloc(count > 0 ? count : 1, sizeof(*mark_sizes));
+    if (marks == NULL || mark_sizes == NULL) {
+        free(marks);
+        free(mark_sizes);
+        marks = NULL;
+        mark_sizes = NULL;
+    }
+
+    panel->mark_count = 0;
+    panel->marked_dirs = 0;
+    panel->marked_bytes = 0;
+    DirEntryInfo *old_entries = panel->entries;
+    panel->entries = entries;
+    panel->count = count;
+    if (marks != NULL && old_marked_count > 0) {
+        for (size_t i = 0; i < count; i++) {
+            const char *name = entries[i].name;
+            if (bsearch(&name, old_marked, old_marked_count, sizeof(*old_marked), compare_names) != NULL) {
+                marks[i] = 1;
+            }
+        }
+    }
+    free(panel->marks);
+    free(panel->mark_sizes);
+    panel->marks = marks;
+    panel->mark_sizes = mark_sizes;
+    if (marks != NULL) {
+        for (size_t i = 0; i < count; i++) {
+            if (marks[i]) {
+                add_mark_totals(panel, i, 1);
+            }
+        }
+    }
+
+    /* old_marked points into the old entries, so they go last. */
+    free(old_marked);
+    if (old_entries != NULL) {
+        dir_list_free(old_entries);
+    }
 }
 
 int panel_reload(Panel *panel)
@@ -106,8 +217,7 @@ int panel_reload(Panel *panel)
             if (fallback != NULL) {
                 snprintf(fallback[0].name, sizeof(fallback[0].name), "..");
                 fallback[0].is_dir = 1;
-                panel->entries = fallback;
-                panel->count = 1;
+                panel_set_listing(panel, fallback, 1, 0);
             }
             panel->scroll_offset = 0;
             panel->selected_index = 0;
@@ -116,11 +226,7 @@ int panel_reload(Panel *panel)
         return 0;
     }
 
-    if (panel->entries != NULL) {
-        dir_list_free(panel->entries);
-    }
-    panel->entries = new_entries;
-    panel->count = new_count;
+    panel_set_listing(panel, new_entries, new_count, 1);
     panel->scroll_offset = 0;
     panel->selected_index = 0;
     return 1;
@@ -149,12 +255,8 @@ int panel_change_dir(Panel *panel, const char *command, char *error_msg, size_t 
         return 0;
     }
 
-    if (panel->entries != NULL) {
-        dir_list_free(panel->entries);
-    }
     snprintf(panel->path, sizeof(panel->path), "%s", new_path);
-    panel->entries = new_entries;
-    panel->count = new_count;
+    panel_set_listing(panel, new_entries, new_count, 0);
     panel->scroll_offset = 0;
     panel->selected_index = 0;
     return 1;
@@ -167,6 +269,50 @@ void panel_free(Panel *panel)
         panel->entries = NULL;
         panel->count = 0;
     }
+    free(panel->marks);
+    free(panel->mark_sizes);
+    panel->marks = NULL;
+    panel->mark_sizes = NULL;
+    panel->mark_count = 0;
+    panel->marked_dirs = 0;
+    panel->marked_bytes = 0;
+}
+
+void panel_toggle_mark(Panel *panel, size_t index)
+{
+    if (panel->marks == NULL || index >= panel->count || !is_markable(&panel->entries[index])) {
+        return;
+    }
+    panel->marks[index] = !panel->marks[index];
+    add_mark_totals(panel, index, panel->marks[index] ? 1 : -1);
+}
+
+void panel_toggle_mark_all(Panel *panel)
+{
+    if (panel->marks == NULL) {
+        return;
+    }
+    size_t markable = 0;
+    for (size_t i = 0; i < panel->count; i++) {
+        markable += is_markable(&panel->entries[i]) ? 1 : 0;
+    }
+    int mark = panel->mark_count < markable;
+    for (size_t i = 0; i < panel->count; i++) {
+        if (is_markable(&panel->entries[i]) && panel->marks[i] != mark) {
+            panel->marks[i] = (unsigned char)mark;
+            add_mark_totals(panel, i, mark ? 1 : -1);
+        }
+    }
+}
+
+void panel_clear_marks(Panel *panel)
+{
+    if (panel->marks != NULL) {
+        memset(panel->marks, 0, panel->count > 0 ? panel->count : 1);
+    }
+    panel->mark_count = 0;
+    panel->marked_dirs = 0;
+    panel->marked_bytes = 0;
 }
 
 void panel_move_selection(Panel *panel, int delta, int visible_rows)
@@ -214,11 +360,14 @@ void panel_draw(const Panel *panel, int row, int col, int width, int height, con
         if (idx < panel->count) {
             const DirEntryInfo *entry = &panel->entries[idx];
 
+            int marked = panel->marks != NULL && panel->marks[idx];
             char text[512];
             const char *icon = icon_for_entry(entry->name, entry->is_dir, theme->icons_enabled);
-            snprintf(text, sizeof(text), "%s %s%s", icon, entry->name, entry->is_dir ? "/" : "");
+            snprintf(text, sizeof(text), "%s %s%s%s", icon, marked ? "*" : "", entry->name,
+                     entry->is_dir ? "/" : "");
 
-            const char *entry_color = entry->is_dir ? theme->dir_color : theme->text_color;
+            const char *entry_color =
+                marked ? theme->mark_color : (entry->is_dir ? theme->dir_color : theme->text_color);
 
             if (is_active && (int)idx == panel->selected_index) {
                 screen_print_at_selected(line_row, col + 1, width - 2, text, theme->cursor_color);
@@ -228,5 +377,19 @@ void panel_draw(const Panel *panel, int row, int col, int width, int height, con
         } else {
             screen_print_at_colored(line_row, col + 1, width - 2, "", theme->text_color);
         }
+    }
+
+    if (panel->mark_count > 0 && width > 6) {
+        /* Drawn into the bottom border, like a title, so marking costs no
+         * entry row; padded with a space each side and clipped to fit. */
+        char summary[96], label[100];
+        format_mark_summary(panel->mark_count, panel->marked_dirs, panel->marked_bytes, summary,
+                            sizeof(summary));
+        snprintf(label, sizeof(label), " %s ", summary);
+        int label_width = (int)strlen(label);
+        if (label_width > width - 4) {
+            label_width = width - 4;
+        }
+        screen_print_at_colored_bold(row + height - 1, col + 2, label_width, label, theme->mark_color);
     }
 }

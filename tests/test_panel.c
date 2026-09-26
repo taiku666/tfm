@@ -203,6 +203,172 @@ TEST(panel_change_dir_cd_failure_leaves_panel_unchanged)
     force_remove_tree(base);
 }
 
+/* --- marks ----------------------------------------------------------------- */
+
+/* Index of name in panel's listing, or -1. */
+static int index_of(const Panel *panel, const char *name)
+{
+    for (size_t i = 0; i < panel->count; i++) {
+        if (strcmp(panel->entries[i].name, name) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static void mark(Panel *panel, const char *name)
+{
+    int index = index_of(panel, name);
+    ASSERT_TRUE(index >= 0);
+    panel_toggle_mark(panel, (size_t)index);
+}
+
+TEST(toggle_mark_tracks_counts_and_sizes)
+{
+    char base[64];
+    make_listing_fixture(base, sizeof(base));
+    Panel panel;
+    panel_init(&panel, base);
+
+    mark(&panel, "a");
+    mark(&panel, "b");
+    mark(&panel, "sub");
+    ASSERT_EQ(panel.mark_count, (size_t)3);
+    ASSERT_EQ(panel.marked_dirs, (size_t)1);
+    ASSERT_EQ(panel.marked_bytes, 2); /* a and b hold one byte each */
+
+    mark(&panel, "a"); /* toggles off */
+    ASSERT_EQ(panel.mark_count, (size_t)2);
+    ASSERT_EQ(panel.marked_bytes, 1);
+    ASSERT_EQ(panel.marks[index_of(&panel, "a")], 0);
+
+    panel_free(&panel);
+    force_remove_tree(base);
+}
+
+TEST(parent_entry_is_never_marked)
+{
+    char base[64];
+    make_listing_fixture(base, sizeof(base));
+    Panel panel;
+    panel_init(&panel, base);
+
+    mark(&panel, "..");
+    ASSERT_EQ(panel.mark_count, (size_t)0);
+    panel_toggle_mark(&panel, panel.count + 5); /* out of range: ignored */
+    ASSERT_EQ(panel.mark_count, (size_t)0);
+
+    panel_free(&panel);
+    force_remove_tree(base);
+}
+
+TEST(toggle_mark_all_marks_everything_then_clears)
+{
+    char base[64];
+    make_listing_fixture(base, sizeof(base));
+    Panel panel;
+    panel_init(&panel, base);
+
+    mark(&panel, "c"); /* a partial selection still means "mark all" */
+    panel_toggle_mark_all(&panel);
+    ASSERT_EQ(panel.mark_count, (size_t)6); /* all but ".." */
+    ASSERT_EQ(panel.marked_dirs, (size_t)1);
+    ASSERT_EQ(panel.marked_bytes, 5);
+    ASSERT_EQ(panel.marks[index_of(&panel, "..")], 0);
+
+    panel_toggle_mark_all(&panel);
+    ASSERT_EQ(panel.mark_count, (size_t)0);
+    ASSERT_EQ(panel.marked_bytes, 0);
+
+    panel_free(&panel);
+    force_remove_tree(base);
+}
+
+TEST(reload_keeps_marks_by_name)
+{
+    char base[64];
+    make_listing_fixture(base, sizeof(base));
+    Panel panel;
+    panel_init(&panel, base);
+    mark(&panel, "b");
+    mark(&panel, "d");
+
+    /* A new entry sorts in before the marked ones and a marked one goes
+     * away, so the marks must follow names, not indices. */
+    char path[PATH_MAX];
+    join_path(path, sizeof(path), base, "/aa");
+    write_file(path, "x");
+    join_path(path, sizeof(path), base, "/d");
+    ASSERT_EQ(unlink(path), 0);
+    ASSERT_EQ(panel_reload(&panel), 1);
+
+    ASSERT_EQ(panel.mark_count, (size_t)1);
+    ASSERT_EQ(panel.marks[index_of(&panel, "b")], 1);
+    ASSERT_EQ(panel.marks[index_of(&panel, "aa")], 0);
+    ASSERT_EQ(panel.marked_bytes, 1);
+
+    panel_free(&panel);
+    force_remove_tree(base);
+}
+
+TEST(change_dir_clears_marks)
+{
+    char base[64];
+    make_listing_fixture(base, sizeof(base));
+    Panel panel;
+    panel_init(&panel, base);
+    mark(&panel, "a");
+    mark(&panel, "b");
+
+    char error_msg[256];
+    ASSERT_EQ(panel_change_dir(&panel, "cd sub", error_msg, sizeof(error_msg)), 1);
+    ASSERT_EQ(panel.mark_count, (size_t)0);
+    ASSERT_EQ(panel_change_dir(&panel, "cd ..", error_msg, sizeof(error_msg)), 1);
+    ASSERT_EQ(panel.mark_count, (size_t)0);
+    ASSERT_EQ(panel.marks[index_of(&panel, "a")], 0);
+
+    panel_free(&panel);
+    force_remove_tree(base);
+}
+
+TEST(unmark_subtracts_the_size_recorded_at_marking)
+{
+    char base[64];
+    make_listing_fixture(base, sizeof(base));
+    Panel panel;
+    panel_init(&panel, base);
+    mark(&panel, "a");
+
+    char path[PATH_MAX];
+    join_path(path, sizeof(path), base, "/a");
+    write_file(path, "grew while marked");
+    mark(&panel, "a");
+    ASSERT_EQ(panel.marked_bytes, 0);
+
+    panel_free(&panel);
+    force_remove_tree(base);
+}
+
+TEST(clear_marks_resets_everything)
+{
+    char base[64];
+    make_listing_fixture(base, sizeof(base));
+    Panel panel;
+    panel_init(&panel, base);
+    panel_toggle_mark_all(&panel);
+    panel_clear_marks(&panel);
+
+    ASSERT_EQ(panel.mark_count, (size_t)0);
+    ASSERT_EQ(panel.marked_dirs, (size_t)0);
+    ASSERT_EQ(panel.marked_bytes, 0);
+    for (size_t i = 0; i < panel.count; i++) {
+        ASSERT_EQ(panel.marks[i], 0);
+    }
+
+    panel_free(&panel);
+    force_remove_tree(base);
+}
+
 int main(void)
 {
     TFM_RUN(panel_reload_success_returns_1);
@@ -211,5 +377,12 @@ int main(void)
     TFM_RUN(panel_change_dir_success_switches_path_and_listing_together);
     TFM_RUN(panel_change_dir_listing_failure_leaves_panel_unchanged);
     TFM_RUN(panel_change_dir_cd_failure_leaves_panel_unchanged);
+    TFM_RUN(toggle_mark_tracks_counts_and_sizes);
+    TFM_RUN(parent_entry_is_never_marked);
+    TFM_RUN(toggle_mark_all_marks_everything_then_clears);
+    TFM_RUN(reload_keeps_marks_by_name);
+    TFM_RUN(change_dir_clears_marks);
+    TFM_RUN(unmark_subtracts_the_size_recorded_at_marking);
+    TFM_RUN(clear_marks_resets_everything);
     return TFM_SUMMARY();
 }

@@ -681,12 +681,25 @@ void screen_draw_progress_popup(const char *title, const char *item, double perc
     fflush(stdout);
 }
 
-/* A button in a choice popup. The shortcut is always the label's first
- * letter (e.g. "Cancel" -> C); Skip/Retry/Abort/Overwrite/Yes/No all have
- * distinct initials. */
+/* A button in a choice popup. The shortcut is the label's first letter
+ * (e.g. "Cancel" -> C), owned by the first button with that initial:
+ * "Skip all" after "Skip" has no shortcut and is reached with the
+ * arrow keys. */
 typedef struct {
     const char *label;
 } DialogButton;
+
+/* 1 if buttons[index] owns its initial as a shortcut (see DialogButton). */
+static int owns_shortcut(const DialogButton *buttons, int index)
+{
+    int initial = toupper((unsigned char)buttons[index].label[0]);
+    for (int i = 0; i < index; i++) {
+        if (toupper((unsigned char)buttons[i].label[0]) == initial) {
+            return 0;
+        }
+    }
+    return 1;
+}
 
 static int button_row_width(const DialogButton *buttons, int count)
 {
@@ -728,11 +741,15 @@ static void draw_button_row(int inner_width, const DialogButton *buttons, int co
             printf("\x1b[7m");
         }
         putchar('[');
-        printf("\x1b[1;4m%c" ANSI_RESET, buttons[i].label[0]);
-        if (active) {
-            printf("\x1b[7m");
+        if (owns_shortcut(buttons, i)) {
+            printf("\x1b[1;4m%c" ANSI_RESET, buttons[i].label[0]);
+            if (active) {
+                printf("\x1b[7m");
+            }
+            printf("%s", buttons[i].label + 1);
+        } else {
+            printf("%s", buttons[i].label);
         }
-        printf("%s", buttons[i].label + 1);
         putchar(']');
         if (active) {
             printf(ANSI_RESET);
@@ -865,20 +882,24 @@ ScreenChoice screen_prompt_choice(const char *title, const char *message)
     return SCREEN_CHOICE_ABORT;
 }
 
-ScreenChoice screen_prompt_overwrite(const char *path)
+ScreenChoice screen_prompt_overwrite(const char *path, int offer_all)
 {
     static const DialogButton buttons[] = {{"Skip"}, {"Overwrite"}, {"Abort"}};
-    int idx = screen_prompt_buttons("Already exists", path, buttons, 3, 0);
+    static const DialogButton buttons_all[] = {
+        {"Skip"}, {"Skip all"}, {"Overwrite"}, {"Overwrite all"}, {"Abort"},
+    };
+    static const ScreenChoice choices[] = {SCREEN_CHOICE_SKIP, SCREEN_CHOICE_OVERWRITE, SCREEN_CHOICE_ABORT};
+    static const ScreenChoice choices_all[] = {
+        SCREEN_CHOICE_SKIP, SCREEN_CHOICE_SKIP_ALL, SCREEN_CHOICE_OVERWRITE, SCREEN_CHOICE_OVERWRITE_ALL,
+        SCREEN_CHOICE_ABORT,
+    };
+
+    int count = offer_all ? 5 : 3;
+    int idx = screen_prompt_buttons("Already exists", path, offer_all ? buttons_all : buttons, count, 0);
     if (idx < 0) {
-        idx = 2; /* Esc -> Abort */
+        return SCREEN_CHOICE_ABORT; /* Esc */
     }
-    if (idx == 0) {
-        return SCREEN_CHOICE_SKIP;
-    }
-    if (idx == 1) {
-        return SCREEN_CHOICE_OVERWRITE;
-    }
-    return SCREEN_CHOICE_ABORT;
+    return offer_all ? choices_all[idx] : choices[idx];
 }
 
 int screen_prompt_text(const char *title, char *buffer, size_t buffer_size)
