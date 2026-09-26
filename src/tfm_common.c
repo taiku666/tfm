@@ -157,6 +157,32 @@ size_t utf8_prev_char_len(const char *buf, size_t len)
     return len - new_len;
 }
 
+int shell_quote(char *out, size_t out_size, const char *str)
+{
+    if (out == NULL || str == NULL || out_size < 3) {
+        return 0;
+    }
+
+    size_t oi = 0;
+    out[oi++] = '\'';
+    for (const char *p = str; *p != '\0'; p++) {
+        size_t need = (*p == '\'') ? 4 : 1;
+        /* + 2 keeps room for the closing quote and the NUL. */
+        if (oi + need + 2 > out_size) {
+            return 0;
+        }
+        if (*p == '\'') {
+            memcpy(out + oi, "'\\''", 4);
+            oi += 4;
+        } else {
+            out[oi++] = *p;
+        }
+    }
+    out[oi++] = '\'';
+    out[oi] = '\0';
+    return 1;
+}
+
 __attribute__((noinline)) const char *unsized(const char *str)
 {
     return str;

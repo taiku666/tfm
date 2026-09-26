@@ -14,6 +14,7 @@
 #include "editor.h"
 #include "fileops.h"
 #include "input.h"
+#include "opener.h"
 #include "panel.h"
 #include "screen.h"
 #include "shell.h"
@@ -98,7 +99,8 @@ static void redraw_ui(const App *app)
     theme.icons_enabled = strcasecmp(cfg->icons, "omarchy") == 0;
 
     static const FunctionKey FUNCTION_KEYS[] = {
-        {"F5", "Copy"}, {"F6", "Move"}, {"F7", "Mkdir"}, {"F8", "Delete"}, {"F9", "Undo"}, {"F10", "Quit"},
+        {"F3", "Edit"}, {"F5", "Copy"}, {"F6", "Move"}, {"F7", "Mkdir"},
+        {"F8", "Delete"}, {"F9", "Undo"}, {"F10", "Quit"},
     };
 
     screen_clear();
@@ -115,10 +117,8 @@ static void redraw_ui(const App *app)
     screen_draw_command_line(CMD_PROMPT, app->cmd_buffer);
 }
 
-/* Shows an info/error popup and waits for a key. Loops and redraws on
- * resize instead of calling input_wait_any_key(), which consumes a
- * SIGWINCH without redrawing and would leave the popup at its old
- * size/position until dismissed. */
+/* Shows an info/error popup and waits for a key, redrawing on every
+ * resize so the popup never stays at its old size/position. */
 static void tui_show_popup(const char *title, const char *message)
 {
     screen_hide_cursor();
@@ -515,38 +515,131 @@ static void handle_navigation(App *app, KeyType key_type)
     redraw_ui(app);
 }
 
-/* Enter with an empty command line: open the selected file in $EDITOR if
- * its extension is listed in tfm.ini's [editor] extensions, or cd into
- * the selected directory. Other files are ignored. */
+/* F3: open the selected file in $EDITOR, whatever its type. */
+static void handle_edit(App *app)
+{
+    Panel *active_panel = app_active_panel(app);
+    const DirEntryInfo *entry = selected_file_entry(active_panel);
+    if (entry == NULL || entry->is_dir) {
+        return;
+    }
+
+    char edit_error[TUI_MSG_BUFFER_SIZE] = "";
+    char file_path[PATH_MAX];
+    if (!path_join(file_path, sizeof(file_path), active_panel->path, entry->name)) {
+        snprintf(edit_error, sizeof(edit_error), "Path too long");
+    } else {
+        input_disable_raw_mode();
+        int exit_code = editor_open(file_path);
+        input_enable_raw_mode();
+        /* See comment in handle_copy(): input_read_key() wasn't being
+         * called while the editor had control. */
+        input_consume_resize_flag();
+
+        panel_reload(&app->left);
+        panel_reload(&app->right);
+
+        if (exit_code != 0) {
+            snprintf(edit_error, sizeof(edit_error), "Editor exited with code %d", exit_code);
+        }
+    }
+    redraw_ui(app);
+
+    if (edit_error[0] != '\0') {
+        tui_show_popup("Error", edit_error);
+        redraw_ui(app);
+    }
+}
+
+/* Keeps a program's output on screen until the user has read it - the
+ * full redraw afterwards would otherwise wipe it at once. A resize just
+ * keeps waiting; EOF or a shutdown signal ends the wait. */
+static void wait_for_key_after_program(void)
+{
+    printf("\n[Press any key to return to tfm]");
+    fflush(stdout);
+    while (!g_shutdown_requested) {
+        KeyEvent key = input_read_key();
+        if (key.type != KEY_NONE) {
+            return;
+        }
+    }
+}
+
+/* Enter on an executable: confirm (default No, so a stray Enter never
+ * runs anything), then run it in the panel's directory like a typed
+ * command. */
+static void run_selected_program(App *app, const DirEntryInfo *entry)
+{
+    Panel *active_panel = app_active_panel(app);
+
+    char confirm_msg[TUI_MSG_BUFFER_SIZE];
+    snprintf(confirm_msg, sizeof(confirm_msg), "Run %s?", entry->name);
+    screen_hide_cursor();
+    int confirmed = screen_prompt_confirm("Run", confirm_msg);
+    screen_show_cursor();
+
+    char run_error[TUI_MSG_BUFFER_SIZE] = "";
+    if (confirmed) {
+        /* "./" so the shell runs this file, not a same-named command
+         * found on $PATH. entry->name is at most 255 bytes, and quoting
+         * at most quadruples it. */
+        char quoted[256 * 4 + 3];
+        char command[sizeof(quoted) + 2];
+        if (!shell_quote(quoted, sizeof(quoted), entry->name)) {
+            snprintf(run_error, sizeof(run_error), "Name too long");
+        } else {
+            snprintf(command, sizeof(command), "./%s", quoted);
+            /* Start the program's output on a blank screen, not on top
+             * of the panels. */
+            screen_clear();
+            fflush(stdout);
+            input_disable_raw_mode();
+            int exit_code = shell_execute(command, active_panel->path);
+            input_enable_raw_mode();
+            wait_for_key_after_program();
+            /* See comment in handle_copy(). */
+            input_consume_resize_flag();
+
+            if (exit_code != 0) {
+                snprintf(run_error, sizeof(run_error), "Exit code %d: %s", exit_code, entry->name);
+            }
+            /* After the message is built: the reload frees entry. */
+            panel_reload(&app->left);
+            panel_reload(&app->right);
+        }
+    }
+    redraw_ui(app);
+
+    if (run_error[0] != '\0') {
+        tui_show_popup("Error", run_error);
+        redraw_ui(app);
+    }
+}
+
+/* Enter with an empty command line: cd into a directory, run an
+ * executable, or open any other file in its default application. */
 static void open_selected_entry(App *app)
 {
     Panel *active_panel = app_active_panel(app);
     const DirEntryInfo *entry = selected_file_entry(active_panel);
-    char enter_error[128] = "";
+    char enter_error[TUI_MSG_BUFFER_SIZE] = "";
 
-    if (entry != NULL && !entry->is_dir && config_is_editor_extension(&app->cfg, entry->name)) {
+    if (entry == NULL || entry->is_dir) {
+        /* Includes "..", which selected_file_entry() leaves out. */
+        if (enter_selected_entry(active_panel, enter_error, sizeof(enter_error))) {
+            app_remember_panel_path(app, active_panel);
+            redraw_ui(app);
+        }
+    } else {
         char file_path[PATH_MAX];
         if (!path_join(file_path, sizeof(file_path), active_panel->path, entry->name)) {
             snprintf(enter_error, sizeof(enter_error), "Path too long");
+        } else if (opener_is_executable(file_path)) {
+            run_selected_program(app, entry);
         } else {
-            input_disable_raw_mode();
-            int exit_code = editor_open(file_path);
-            input_enable_raw_mode();
-            /* See comment in handle_copy(): input_read_key() wasn't being
-             * called while the editor had control. */
-            input_consume_resize_flag();
-
-            panel_reload(&app->left);
-            panel_reload(&app->right);
-
-            if (exit_code != 0) {
-                snprintf(enter_error, sizeof(enter_error), "Editor exited with code %d", exit_code);
-            }
+            opener_open_default(file_path, enter_error, sizeof(enter_error));
         }
-        redraw_ui(app);
-    } else if (enter_selected_entry(active_panel, enter_error, sizeof(enter_error))) {
-        app_remember_panel_path(app, active_panel);
-        redraw_ui(app);
     }
 
     if (enter_error[0] != '\0') {
@@ -623,6 +716,9 @@ static int dispatch_key(App *app, KeyEvent key)
     switch (key.type) {
         case KEY_F10:
             return 0;
+        case KEY_F3:
+            handle_edit(app);
+            break;
         case KEY_F5:
             handle_copy(app);
             break;

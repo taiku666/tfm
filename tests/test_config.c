@@ -38,10 +38,6 @@ TEST(config_set_defaults_uses_home)
     ASSERT_STR_EQ(cfg.dir_color, "blue");
     ASSERT_STR_EQ(cfg.icons, "omarchy");
     ASSERT_STR_EQ(cfg.gui_theme, "omarchy");
-    /* Behavior, not the literal default string (which isn't part of the
-     * public API) - a fresh config must already recognize an ordinary
-     * text file as an editor extension. */
-    ASSERT_TRUE(config_is_editor_extension(&cfg, "notes.txt"));
 
     force_remove_tree(base);
 }
@@ -227,7 +223,6 @@ TEST(config_save_and_load_round_trip)
     snprintf(cfg.dir_color, sizeof(cfg.dir_color), "cyan");
     snprintf(cfg.icons, sizeof(cfg.icons), "off");
     snprintf(cfg.gui_theme, sizeof(cfg.gui_theme), "system");
-    snprintf(cfg.editor_extensions, sizeof(cfg.editor_extensions), "foo,bar");
 
     char error_msg[256] = "unset";
     config_save(&cfg, error_msg, sizeof(error_msg));
@@ -240,7 +235,6 @@ TEST(config_save_and_load_round_trip)
     ASSERT_STR_EQ(loaded.dir_color, "cyan");
     ASSERT_STR_EQ(loaded.icons, "off");
     ASSERT_STR_EQ(loaded.gui_theme, "system");
-    ASSERT_STR_EQ(loaded.editor_extensions, "foo,bar");
     ASSERT_STR_EQ(loaded.left_path, home);
     ASSERT_STR_EQ(loaded.right_path, home);
 
@@ -363,36 +357,12 @@ TEST(config_get_path_too_long_on_load_and_save)
     ASSERT_STR_EQ(error_msg, "Path too long");
 }
 
-/* --- config_is_editor_extension ------------------------------------------- */
+/* --- legacy [editor] section -------------------------------------------- */
 
-TEST(config_is_editor_extension_case_insensitive_default_list)
-{
-    Config cfg;
-    config_set_defaults(&cfg);
-    ASSERT_TRUE(config_is_editor_extension(&cfg, "notes.txt"));
-    ASSERT_TRUE(config_is_editor_extension(&cfg, "notes.TXT"));
-    ASSERT_TRUE(config_is_editor_extension(&cfg, "main.C"));
-}
-
-TEST(config_is_editor_extension_rejects_non_matches)
-{
-    Config cfg;
-    config_set_defaults(&cfg);
-    ASSERT_FALSE(config_is_editor_extension(&cfg, "README"));
-    ASSERT_FALSE(config_is_editor_extension(&cfg, ".bashrc"));
-    ASSERT_FALSE(config_is_editor_extension(&cfg, "file."));
-    ASSERT_FALSE(config_is_editor_extension(&cfg, "program.exe"));
-}
-
-TEST(config_is_editor_extension_null_args)
-{
-    Config cfg;
-    config_set_defaults(&cfg);
-    ASSERT_FALSE(config_is_editor_extension(NULL, "notes.txt"));
-    ASSERT_FALSE(config_is_editor_extension(&cfg, NULL));
-}
-
-TEST(config_is_editor_extension_uses_loaded_custom_list)
+/* tfm.ini files written before F3 could edit any file carry an [editor]
+ * extensions list. It must be skipped without disturbing the keys around
+ * it, and the next save must drop it. */
+TEST(config_load_skips_legacy_editor_section)
 {
     char base[64];
     make_temp_dir(base, sizeof(base));
@@ -402,23 +372,26 @@ TEST(config_is_editor_extension_uses_loaded_custom_list)
     join_path(ini_path, sizeof(ini_path), tfm_dir, "/tfm.ini");
     ASSERT_EQ(mkdir(home, 0755), 0);
     ASSERT_EQ(mkdir(tfm_dir, 0755), 0);
-    /* Deliberate surrounding whitespace around a couple of entries - the
-     * per-token trim() inside config_is_editor_extension() must still
-     * match them. */
-    write_file(ini_path, "[editor]\nextensions=foo, BAR ,baz\n");
+    write_file(ini_path, "[display]\ndir_color=cyan\n\n[editor]\nextensions=foo,bar\n\n"
+                         "[display]\nicons=off\n");
 
     SavedEnvVar __attribute__((cleanup(restore_env_var))) saved_home;
     save_and_set_env_var(&saved_home, "HOME", home);
 
     Config cfg;
-    char error_msg[256] = "";
+    char error_msg[256] = "unset";
     config_load(&cfg, error_msg, sizeof(error_msg));
     ASSERT_STR_EQ(error_msg, "");
-    ASSERT_TRUE(config_is_editor_extension(&cfg, "x.foo"));
-    ASSERT_TRUE(config_is_editor_extension(&cfg, "x.bar"));
-    ASSERT_TRUE(config_is_editor_extension(&cfg, "x.baz"));
-    /* The default list is replaced, not merged, once [editor] is present. */
-    ASSERT_FALSE(config_is_editor_extension(&cfg, "x.txt"));
+    ASSERT_STR_EQ(cfg.dir_color, "cyan");
+    ASSERT_STR_EQ(cfg.icons, "off");
+
+    config_save(&cfg, error_msg, sizeof(error_msg));
+    ASSERT_STR_EQ(error_msg, "");
+    char saved[4096];
+    read_file(ini_path, saved, sizeof(saved));
+    ASSERT_TRUE(strstr(saved, "[editor]") == NULL);
+    ASSERT_TRUE(strstr(saved, "extensions=") == NULL);
+    ASSERT_TRUE(strstr(saved, "dir_color=cyan") != NULL);
 
     force_remove_tree(base);
 }
@@ -437,9 +410,6 @@ int main(void)
     TFM_RUN(config_save_blocked_by_file_at_config_dir_path);
     TFM_RUN(config_save_reports_permission_failure);
     TFM_RUN(config_get_path_too_long_on_load_and_save);
-    TFM_RUN(config_is_editor_extension_case_insensitive_default_list);
-    TFM_RUN(config_is_editor_extension_rejects_non_matches);
-    TFM_RUN(config_is_editor_extension_null_args);
-    TFM_RUN(config_is_editor_extension_uses_loaded_custom_list);
+    TFM_RUN(config_load_skips_legacy_editor_section);
     return TFM_SUMMARY();
 }

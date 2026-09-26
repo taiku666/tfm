@@ -3,6 +3,22 @@
 Versioned via `TFM_VERSION` in `include/tfm_common.h` and git tags
 (`vX.Y.Z`); this file tracks notable changes per release.
 
+## Unreleased
+
+- **Enter opens the selection, F3 edits it (TUI and GUI).** Enter on a
+  file now opens it in the desktop's default application for its type
+  (image viewer, PDF reader, video player, ...) via GIO - `gio open` in
+  the TUI, the GIO API directly in the GUI - so both front-ends pick the
+  same apps as other file managers, and Terminal=true apps like nvim
+  start in a new terminal window. The app runs detached (own session,
+  output on /dev/null), so it never draws over the TUI and survives
+  tfm's terminal closing. Executables are run instead, after a Run/Cancel
+  confirmation (default Cancel), in the panel's directory; the TUI keeps
+  their output on screen until a key is pressed. A file type
+  with no default application shows an error popup. F3 opens any file in
+  `$EDITOR`; the `[editor]` extensions list in `tfm.ini` is gone (an old
+  file with it still loads, and the section is dropped on the next save).
+
 ## 0.5.0
 
 - **Recoverable delete (trash/undo).** F8 now moves the selected item to

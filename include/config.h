@@ -18,9 +18,6 @@ typedef struct {
                                      * settings). "omarchy" falls back to
                                      * "system" automatically when no Omarchy
                                      * theme is found. */
-    char editor_extensions[256];   /* comma-separated list of extensions
-                                     * (no dot) for which Enter opens the
-                                     * editor; see config_is_editor_extension(). */
 } Config;
 
 /* Fills cfg with sane defaults ($HOME as start dir for both panels,
@@ -39,10 +36,5 @@ void config_load(Config *cfg, char *error_msg, size_t error_msg_size);
  * error_msg[0] is '\0' on success or a human-readable reason for the
  * failure (naming the real syscall failure) otherwise. */
 void config_save(const Config *cfg, char *error_msg, size_t error_msg_size);
-
-/* Checks whether filename's extension (case-insensitive) is in
- * cfg->editor_extensions. Returns 1 on match, 0 otherwise (including a
- * NULL cfg or filename). */
-int config_is_editor_extension(const Config *cfg, const char *filename);
 
 #endif

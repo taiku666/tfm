@@ -6,13 +6,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
-/* Default list used when tfm.ini has no (or an empty) [editor] section. */
-#define DEFAULT_EDITOR_EXTENSIONS \
-    "md,txt,ini,lua,c,h,cpp,hpp,py,sh,json,yaml,yml,conf,cfg,toml,log,rs,go,js,ts,css,html,xml"
 
 #define CONFIG_DIR_NAME ".tfm"
 #define CONFIG_FILE_NAME "tfm.ini"
@@ -61,7 +56,6 @@ void config_set_defaults(Config *cfg)
     snprintf(cfg->dir_color, sizeof(cfg->dir_color), "blue");
     snprintf(cfg->icons, sizeof(cfg->icons), "omarchy");
     snprintf(cfg->gui_theme, sizeof(cfg->gui_theme), "omarchy");
-    snprintf(cfg->editor_extensions, sizeof(cfg->editor_extensions), DEFAULT_EDITOR_EXTENSIONS);
 }
 
 /* Escapes a value for one INI line: '\' -> "\\", '\n' -> "\n" (literal
@@ -232,11 +226,9 @@ void config_load(Config *cfg, char *error_msg, size_t error_msg_size)
             } else if (strcmp(key, "gui_theme") == 0) {
                 snprintf(cfg->gui_theme, sizeof(cfg->gui_theme), "%s", value);
             }
-        } else if (strcmp(section, "editor") == 0) {
-            if (strcmp(key, "extensions") == 0) {
-                snprintf(cfg->editor_extensions, sizeof(cfg->editor_extensions), "%s", value);
-            }
         }
+        /* Unknown sections are skipped, e.g. the [editor] extensions list
+         * from tfm.ini files written before F3 could edit any file. */
     }
 
     fclose(fp);
@@ -328,8 +320,6 @@ void config_save(const Config *cfg, char *error_msg, size_t error_msg_size)
     WRITE_KV("dir_color", cfg->dir_color);
     WRITE_KV("icons", cfg->icons);
     WRITE_KV("gui_theme", cfg->gui_theme);
-    ok = ok && fprintf(fp, "\n[editor]\n") >= 0;
-    WRITE_KV("extensions", cfg->editor_extensions);
 
 #undef WRITE_KV
 
@@ -356,30 +346,4 @@ void config_save(const Config *cfg, char *error_msg, size_t error_msg_size)
         snprintf(error_msg, error_msg_size, "Cannot save to \"%s\": %s", path, strerror(errno));
     }
     remove(tmp_path);
-}
-
-int config_is_editor_extension(const Config *cfg, const char *filename)
-{
-    if (cfg == NULL || filename == NULL) {
-        return 0;
-    }
-
-    const char *dot = strrchr(filename, '.');
-    if (dot == NULL || dot == filename || dot[1] == '\0') {
-        /* A leading dot (e.g. ".bashrc") is part of the filename, not an extension. */
-        return 0;
-    }
-    const char *ext = dot + 1;
-
-    char list[sizeof(cfg->editor_extensions)];
-    snprintf(list, sizeof(list), "%s", cfg->editor_extensions);
-
-    char *saveptr = NULL;
-    for (char *tok = strtok_r(list, ",", &saveptr); tok != NULL; tok = strtok_r(NULL, ",", &saveptr)) {
-        char *entry = trim(tok);
-        if (entry[0] != '\0' && strcasecmp(entry, ext) == 0) {
-            return 1;
-        }
-    }
-    return 0;
 }

@@ -28,6 +28,7 @@
 #include "omarchy_theme.h"
 #include "editor.h"
 #include "fileops.h"
+#include "opener.h"
 #include "shell.h"
 #include "tfm_common.h"
 
@@ -126,6 +127,7 @@ static void focus_panel(int index)
 }
 
 static void show_error_dialog(const char *title, const char *message);
+static gboolean confirm_dialog(const char *title, const char *message, const char *confirm_label);
 
 /* Holds an initial-load-failure message (see panel_load() below) until
  * the main window is presented. panel_load() first runs before
@@ -474,6 +476,80 @@ static void gui_pump_main_context(void *ctx)
     }
 }
 
+/* F3: open the file at file_path in $EDITOR, whatever its type. */
+static void edit_file(const char *file_path)
+{
+    /* Bracketed like every other pumped wait in this file - without it,
+     * F5-F8/Tab or another activation during the editor session could
+     * copy/move/delete the file out from under the still-open editor. */
+    gui_modal_enter();
+    int exit_code = editor_open_cb(file_path, gui_pump_main_context, NULL);
+    gui_modal_leave();
+    if (exit_code != 0) {
+        char message[64];
+        snprintf(message, sizeof(message), "Editor exited with code %d", exit_code);
+        show_error_dialog("Error", message);
+    }
+}
+
+/* Enter on an executable: confirm, then run it in the panel's directory
+ * like a command typed into the shell entry. */
+static void run_program(GuiPanel *panel, const char *name)
+{
+    char message[300];
+    snprintf(message, sizeof(message), "Run \"%s\"?", name);
+    if (!confirm_dialog("Run", message, "Run")) {
+        return;
+    }
+
+    /* "./" so the shell runs this file, not a same-named command found
+     * on $PATH. name is at most 255 bytes; quoting at most quadruples it. */
+    char quoted[256 * 4 + 3];
+    char command[sizeof(quoted) + 2];
+    if (!shell_quote(quoted, sizeof(quoted), name)) {
+        show_error_dialog("Error", "Name too long");
+        return;
+    }
+    snprintf(command, sizeof(command), "./%s", quoted);
+
+    gui_modal_enter();
+    int exit_code = shell_execute_cb(command, panel->path, gui_pump_main_context, NULL);
+    gui_modal_leave();
+    if (exit_code != 0) {
+        snprintf(message, sizeof(message), "Exit code %d: %s", exit_code, name);
+        show_error_dialog("Error", message);
+    }
+
+    panel_load(&g_panel[0], g_panel[0].path);
+    panel_load(&g_panel[1], g_panel[1].path);
+}
+
+/* Opens file_path in its default application. GIO directly rather than
+ * the TUI's `gio open` subprocess: same mimeapps.list lookup, but the
+ * launch context hands the new window a Wayland activation token so it
+ * comes up focused. */
+static void open_with_default_app(const char *file_path, const char *name)
+{
+    GFile *file = g_file_new_for_path(file_path);
+    char *uri = g_file_get_uri(file);
+    GdkAppLaunchContext *context = gdk_display_get_app_launch_context(gdk_display_get_default());
+    GError *error = NULL;
+
+    if (!g_app_info_launch_default_for_uri(uri, G_APP_LAUNCH_CONTEXT(context), &error)) {
+        char message[512];
+        snprintf(message, sizeof(message), "Could not open \"%s\": %s", name,
+                 error != NULL ? error->message : "unknown error");
+        show_error_dialog("Error", message);
+        g_clear_error(&error);
+    }
+
+    g_object_unref(context);
+    g_free(uri);
+    g_object_unref(file);
+}
+
+/* Enter/double-click: cd into a directory, run an executable, or open
+ * any other file in its default application. */
 static void on_item_activated(GtkListView *list_view, guint position, gpointer user_data)
 {
     if (g_modal_depth > 0) {
@@ -492,27 +568,14 @@ static void on_item_activated(GtkListView *list_view, guint position, gpointer u
     }
     if (item->is_dir) {
         panel_navigate_into(panel, item->name);
-    } else if (config_is_editor_extension(&g_cfg, item->name)) {
-        /* Extensions listed in tfm.ini's [editor] section open blocking
-         * in $EDITOR (fallback "vi"); other extensions are ignored. */
+    } else {
         char file_path[PATH_MAX];
-        if ((size_t)snprintf(file_path, sizeof(file_path), "%s/%s", panel->path, item->name) >=
-            sizeof(file_path)) {
+        if (!path_join(file_path, sizeof(file_path), panel->path, item->name)) {
             show_error_dialog("Error", "Path too long");
+        } else if (opener_is_executable(file_path)) {
+            run_program(panel, item->name);
         } else {
-            /* Bracketed like every other pumped wait in this file
-             * (shell, fileops, dialogs) - without this, F5-F8/Tab (or
-             * another activation) during the editor session could
-             * copy/move/delete the file out from under the still-open
-             * external editor. */
-            gui_modal_enter();
-            int exit_code = editor_open_cb(file_path, gui_pump_main_context, NULL);
-            gui_modal_leave();
-            if (exit_code != 0) {
-                char message[64];
-                snprintf(message, sizeof(message), "Editor exited with code %d", exit_code);
-                show_error_dialog("Error", message);
-            }
+            open_with_default_app(file_path, item->name);
         }
     }
     g_object_unref(item);
@@ -670,15 +733,16 @@ static GtkWidget *build_shell_bar(void)
     return bar;
 }
 
-/* Bottom function-key bar: F5 Copy, F6 Move, F7 Mkdir, F8 Delete, F9
- * Undo, F10 Quit. */
+/* Bottom function-key bar: F3 Edit, F5 Copy, F6 Move, F7 Mkdir, F8
+ * Delete, F9 Undo, F10 Quit. */
 typedef struct {
     const char *key;
     const char *label;
 } FunctionKeyDef;
 
 static const FunctionKeyDef FUNCTION_KEYS[] = {
-    {"F5", "Copy"}, {"F6", "Move"}, {"F7", "Mkdir"}, {"F8", "Delete"}, {"F9", "Undo"}, {"F10", "Quit"},
+    {"F3", "Edit"}, {"F5", "Copy"}, {"F6", "Move"}, {"F7", "Mkdir"},
+    {"F8", "Delete"}, {"F9", "Undo"}, {"F10", "Quit"},
 };
 
 /* Returns the panel's currently selected item (transfer none per
@@ -1008,6 +1072,23 @@ static const FileOpCallbacks gui_fileop_callbacks = {
     .ctx = NULL,
 };
 
+static void action_edit(void)
+{
+    GuiPanel *active = &g_panel[g_focused_panel];
+    TfmFileItem *item = panel_get_selected_item(active);
+    if (item == NULL || item->is_dir) {
+        return;
+    }
+    char file_path[PATH_MAX];
+    if (!path_join(file_path, sizeof(file_path), active->path, item->name)) {
+        show_error_dialog("Error", "Path too long");
+        return;
+    }
+    edit_file(file_path);
+    panel_load(&g_panel[0], g_panel[0].path);
+    panel_load(&g_panel[1], g_panel[1].path);
+}
+
 static void action_copy(void)
 {
     GuiPanel *active = &g_panel[g_focused_panel];
@@ -1215,7 +1296,9 @@ static void on_function_button_clicked(GtkButton *button, gpointer user_data)
          * re-enter copy/move/mkdir/delete on the same file. */
         return;
     }
-    if (strcmp(key, "F5") == 0) {
+    if (strcmp(key, "F3") == 0) {
+        action_edit();
+    } else if (strcmp(key, "F5") == 0) {
         action_copy();
     } else if (strcmp(key, "F6") == 0) {
         action_move();
@@ -1468,7 +1551,12 @@ static gboolean on_window_key_pressed(GtkEventControllerKey *controller, guint k
         return GDK_EVENT_STOP;
     }
 
-    /* F5-F8/F10 also work as keyboard shortcuts, not just via the button bar. */
+    /* F3 and F5-F10 also work as keyboard shortcuts, not just via the
+     * button bar. */
+    if (keyval == GDK_KEY_F3) {
+        action_edit();
+        return GDK_EVENT_STOP;
+    }
     if (keyval == GDK_KEY_F5) {
         action_copy();
         return GDK_EVENT_STOP;

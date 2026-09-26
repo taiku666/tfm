@@ -22,29 +22,11 @@ int editor_open_cb(const char *path, void (*pump)(void *ctx), void *pump_ctx)
         editor = "vi";
     }
 
-    /* Single-quote path so spaces/special chars are safe; embedded '
-     * is escaped with the standard '\'' POSIX trick. */
     char quoted[PATH_MAX * 4];
-    size_t qi = 0;
-    quoted[qi++] = '\'';
-    const char *p = path;
-    for (; *p != '\0' && qi < sizeof(quoted) - 5; p++) {
-        if (*p == '\'') {
-            quoted[qi++] = '\'';
-            quoted[qi++] = '\\';
-            quoted[qi++] = '\'';
-            quoted[qi++] = '\'';
-        } else {
-            quoted[qi++] = *p;
-        }
-    }
-    if (*p != '\0') {
-        /* Buffer ran out before path did - continuing would silently
-         * open a truncated, different path. */
+    if (!shell_quote(quoted, sizeof(quoted), path)) {
+        /* Continuing with a truncated word would open a different file. */
         return -1;
     }
-    quoted[qi++] = '\'';
-    quoted[qi] = '\0';
 
     char command[sizeof(quoted) + 256];
     if ((size_t)snprintf(command, sizeof(command), "%s %s", editor, quoted) >= sizeof(command)) {

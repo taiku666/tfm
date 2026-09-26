@@ -28,7 +28,11 @@ follows your Omarchy theme automatically.
   same one GNOME Files/Dolphin use) instead of deleting outright; F9
   (or Ctrl+Z in the GUI) undoes the most recent one. Shift+F8 bypasses
   the trash for a real, permanent delete.
-- **Built-in editor launch** (`$EDITOR`) for text files, by extension.
+- **Enter opens anything** — folders are entered, executables run after a
+  confirmation, and every other file opens in its default application
+  (the same `mimeapps.list` defaults as GNOME Files/Dolphin, via GIO), so
+  pictures open in your image viewer and PDFs in your PDF reader.
+- **F3 edits any file** in `$EDITOR`.
 - **Command shell bar**, with `cd` support in both front-ends.
 - **Persisted configuration** (`tfm.ini`): last-visited directory per panel,
   restored on startup.

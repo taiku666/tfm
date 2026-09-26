@@ -297,9 +297,8 @@ void screen_draw_function_bar(const FunctionKey *keys, int count, const char *co
         max_width = 0;
     }
 
-    /* Unlike every other bar in this file, this one had no width limit -
-     * long/many key labels could wrap past the line. Stop at an entry
-     * boundary rather than mid-label. */
+    /* Stop at an entry boundary once the line is full, rather than
+     * wrapping or cutting a label in half. */
     int used = 0;
     for (int i = 0; i < count; i++) {
         int entry_width = utf8_visual_width(keys[i].key) + 1 + utf8_visual_width(keys[i].label) + 2;

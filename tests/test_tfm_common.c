@@ -298,6 +298,59 @@ TEST(utf8_prev_char_len_lone_lead_byte_without_continuation)
     ASSERT_EQ(utf8_prev_char_len(buf, sizeof(buf)), 1);
 }
 
+/* --- shell_quote ------------------------------------------------------ */
+
+TEST(shell_quote_plain_and_embedded_quote)
+{
+    char out[64];
+    ASSERT_EQ(shell_quote(out, sizeof(out), "my file"), 1);
+    ASSERT_STR_EQ(out, "'my file'");
+    ASSERT_EQ(shell_quote(out, sizeof(out), "it's"), 1);
+    ASSERT_STR_EQ(out, "'it'\\''s'");
+    ASSERT_EQ(shell_quote(out, sizeof(out), ""), 1);
+    ASSERT_STR_EQ(out, "''");
+}
+
+/* The real contract: whatever the name contains, /bin/sh reads the quoted
+ * word back as exactly that name - no expansion, splitting or injection. */
+TEST(shell_quote_round_trips_through_real_shell)
+{
+    const char *nasty = "a b'c\"d$(touch x)`e`;f*g\\h\tz";
+    char quoted[256];
+    ASSERT_EQ(shell_quote(quoted, sizeof(quoted), nasty), 1);
+
+    char command[512];
+    snprintf(command, sizeof(command), "printf %%s %s", quoted);
+    FILE *p = popen(command, "r");
+    ASSERT_TRUE(p != NULL);
+    char echoed[256] = "";
+    size_t n = fread(echoed, 1, sizeof(echoed) - 1, p);
+    echoed[n] = '\0';
+    ASSERT_EQ(pclose(p), 0);
+    ASSERT_STR_EQ(echoed, nasty);
+}
+
+TEST(shell_quote_exact_fit_and_truncation)
+{
+    /* "abc" needs 'abc' + NUL = 6 bytes. */
+    char out[6];
+    ASSERT_EQ(shell_quote(out, 6, "abc"), 1);
+    ASSERT_STR_EQ(out, "'abc'");
+    ASSERT_EQ(shell_quote(out, 5, "abc"), 0);
+    /* An embedded quote becomes '\'' - "'" needs ''\''' + NUL = 7 bytes. */
+    char q[7];
+    ASSERT_EQ(shell_quote(q, 7, "'"), 1);
+    ASSERT_EQ(shell_quote(q, 6, "'"), 0);
+}
+
+TEST(shell_quote_null_args)
+{
+    char out[16];
+    ASSERT_EQ(shell_quote(NULL, sizeof(out), "a"), 0);
+    ASSERT_EQ(shell_quote(out, sizeof(out), NULL), 0);
+    ASSERT_EQ(shell_quote(out, 2, ""), 0);
+}
+
 int main(void)
 {
     TFM_RUN(path_join_basic);
@@ -321,5 +374,9 @@ int main(void)
     TFM_RUN(utf8_prev_char_len_four_byte);
     TFM_RUN(utf8_prev_char_len_caps_malformed_continuation_run);
     TFM_RUN(utf8_prev_char_len_lone_lead_byte_without_continuation);
+    TFM_RUN(shell_quote_plain_and_embedded_quote);
+    TFM_RUN(shell_quote_round_trips_through_real_shell);
+    TFM_RUN(shell_quote_exact_fit_and_truncation);
+    TFM_RUN(shell_quote_null_args);
     return TFM_SUMMARY();
 }

@@ -22,6 +22,12 @@ int path_join(char *out, size_t out_size, const char *dir, const char *name);
  * Returns 1 if safe, 0 otherwise. */
 int is_safe_path_component(const char *name);
 
+/* Writes str into out as one single-quoted POSIX shell word, safe for
+ * any filename: an embedded ' becomes '\'' (close, escaped quote,
+ * reopen). Returns 1 on success, 0 if out/str is NULL or the result
+ * didn't fit - a truncated word would name a different file. */
+int shell_quote(char *out, size_t out_size, const char *str);
+
 /* Resolves a "cd [path]" command against current_dir (buffer of at least
  * PATH_MAX bytes), validating with realpath()+stat()+opendir(). Returns 1
  * and updates current_dir on success; returns 0 and writes a reason into
