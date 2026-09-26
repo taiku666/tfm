@@ -3,6 +3,12 @@
 Versioned via `TFM_VERSION` in `include/tfm_common.h` and git tags
 (`vX.Y.Z`); this file tracks notable changes per release.
 
+## Unreleased
+
+- Commands typed into the TUI's `$` line now keep their output on screen
+  until a key is pressed, like programs started with Enter, instead of
+  it being wiped by the redraw right away. `cd` is unaffected.
+
 ## 0.6.0
 
 - **Enter opens the selection, F3 edits it (TUI and GUI).** Enter on a

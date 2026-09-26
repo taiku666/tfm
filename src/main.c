@@ -663,9 +663,13 @@ static void run_command_line(App *app)
             app_remember_panel_path(app, active_panel);
         }
     } else {
+        /* Same blank screen and pause as run_selected_program(). */
+        screen_clear();
+        fflush(stdout);
         input_disable_raw_mode();
         int exit_code = shell_execute(app->cmd_buffer, active_panel->path);
         input_enable_raw_mode();
+        wait_for_key_after_program();
         /* See comment in handle_copy(). */
         input_consume_resize_flag();
 
