@@ -3,10 +3,8 @@
 Versioned via `TFM_VERSION` in `include/tfm_common.h` and git tags
 (`vX.Y.Z`); this file tracks notable changes per release.
 
-## Unreleased
+## 0.7.0
 
-- GUI dialogs now show a focus ring on the selected button, so keyboard
-  users can see which answer Space or Enter will pick.
 - **Multi-select (TUI and GUI).** Space (TUI: only with an empty `$`
   line, so it stays a space in commands) and Insert mark or unmark the
   highlighted entry and move down; `*` marks everything except `..`, or
@@ -26,6 +24,10 @@ Versioned via `TFM_VERSION` in `include/tfm_common.h` and git tags
 - Commands typed into the TUI's `$` line now keep their output on screen
   until a key is pressed, like programs started with Enter, instead of
   it being wiped by the redraw right away. `cd` is unaffected.
+- GUI dialogs now show a focus ring on the selected button, so keyboard
+  users can see which answer Space or Enter will pick.
+- For contributors: `make compile_commands.json` writes a compile database
+  so clangd and other LSP editors see the real build flags (gitignored).
 
 ## 0.6.0
 
