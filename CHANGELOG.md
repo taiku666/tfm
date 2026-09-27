@@ -3,6 +3,15 @@
 Versioned via `TFM_VERSION` in `include/tfm_common.h` and git tags
 (`vX.Y.Z`); this file tracks notable changes per release.
 
+## Unreleased
+
+- The TUI now keeps the cursor on the same entry after a panel reload
+  (after F5/F6/F8, F9, the editor, a program or a `$` command), on the
+  same screen row, instead of jumping back to the top - matching the
+  GUI. If that entry is gone, the cursor lands on its neighbor.
+- CI: `actions/checkout` bumped to v7 (Node 24), dropping the Node 20
+  deprecation warning.
+
 ## 0.7.0
 
 - **Multi-select (TUI and GUI).** Space (TUI: only with an empty `$`

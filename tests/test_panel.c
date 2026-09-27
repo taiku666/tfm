@@ -311,6 +311,59 @@ TEST(reload_keeps_marks_by_name)
     force_remove_tree(base);
 }
 
+TEST(reload_keeps_cursor_on_same_entry_and_screen_row)
+{
+    char base[64];
+    make_listing_fixture(base, sizeof(base));
+    Panel panel;
+    panel_init(&panel, base);
+    /* "..", "sub", a, b, c, d, e: cursor on "d" (5), third visible row. */
+    panel.selected_index = index_of(&panel, "d");
+    panel.scroll_offset = 3;
+
+    /* "aa" sorts in before "d", shifting it down by one index. */
+    char path[PATH_MAX];
+    join_path(path, sizeof(path), base, "/aa");
+    write_file(path, "x");
+    ASSERT_EQ(panel_reload(&panel), 1);
+
+    ASSERT_EQ(panel.selected_index, index_of(&panel, "d"));
+    ASSERT_EQ(panel.selected_index, 6);
+    ASSERT_EQ(panel.scroll_offset, 4);
+
+    panel_free(&panel);
+    force_remove_tree(base);
+}
+
+TEST(reload_moves_cursor_to_neighbor_when_entry_is_gone)
+{
+    char base[64];
+    make_listing_fixture(base, sizeof(base));
+    Panel panel;
+    panel_init(&panel, base);
+    char path[PATH_MAX];
+
+    /* Mid-listing: the cursor stays at the same index, now "d". */
+    panel.selected_index = index_of(&panel, "c");
+    join_path(path, sizeof(path), base, "/c");
+    ASSERT_EQ(unlink(path), 0);
+    ASSERT_EQ(panel_reload(&panel), 1);
+    ASSERT_STR_EQ(panel.entries[panel.selected_index].name, "d");
+
+    /* Last entry: clamped to the new last one. */
+    panel.selected_index = index_of(&panel, "e");
+    panel.scroll_offset = 0;
+    join_path(path, sizeof(path), base, "/e");
+    ASSERT_EQ(unlink(path), 0);
+    ASSERT_EQ(panel_reload(&panel), 1);
+    ASSERT_EQ((size_t)panel.selected_index, panel.count - 1);
+    ASSERT_STR_EQ(panel.entries[panel.selected_index].name, "d");
+    ASSERT_TRUE(panel.scroll_offset <= panel.selected_index);
+
+    panel_free(&panel);
+    force_remove_tree(base);
+}
+
 TEST(change_dir_clears_marks)
 {
     char base[64];
@@ -381,6 +434,8 @@ int main(void)
     TFM_RUN(parent_entry_is_never_marked);
     TFM_RUN(toggle_mark_all_marks_everything_then_clears);
     TFM_RUN(reload_keeps_marks_by_name);
+    TFM_RUN(reload_keeps_cursor_on_same_entry_and_screen_row);
+    TFM_RUN(reload_moves_cursor_to_neighbor_when_entry_is_gone);
     TFM_RUN(change_dir_clears_marks);
     TFM_RUN(unmark_subtracts_the_size_recorded_at_marking);
     TFM_RUN(clear_marks_resets_everything);

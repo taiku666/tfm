@@ -44,7 +44,9 @@ typedef struct {
 void panel_init(Panel *panel, const char *path);
 
 /* Reloads the current directory (panel->path). Returns 1 on success;
- * marks carry over by name, so entries that still exist stay marked. On
+ * marks carry over by name, so entries that still exist stay marked, and
+ * the cursor stays on the same entry by name (or at the same index,
+ * clamped, if that entry is gone) on the same screen row. On
  * failure returns 0 (errno set by dir_list()) and keeps the previous
  * listing, marks and cursor/scroll position intact, or - if there was no
  * listing yet - installs a single ".." entry so the panel isn't a dead

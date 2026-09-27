@@ -226,9 +226,44 @@ int panel_reload(Panel *panel)
         return 0;
     }
 
+    /* Keep the cursor on the same entry by name, like the GUI does - a
+     * reload after F5/F8/an editor session etc. would otherwise throw the
+     * user back to the top of a long listing. If that entry is gone
+     * (deleted, moved away, renamed) the cursor stays at the same index,
+     * clamped to the new end, so it lands on a neighbor. Copied before
+     * panel_set_listing() frees the old entries. */
+    char selected_name[sizeof(panel->entries[0].name)] = "";
+    int old_selected = panel->selected_index;
+    int old_row = panel->selected_index - panel->scroll_offset;
+    if (panel->entries != NULL && panel->selected_index >= 0 && (size_t)panel->selected_index < panel->count) {
+        snprintf(selected_name, sizeof(selected_name), "%s", panel->entries[panel->selected_index].name);
+    }
+
     panel_set_listing(panel, new_entries, new_count, 1);
-    panel->scroll_offset = 0;
-    panel->selected_index = 0;
+
+    int new_selected = 0;
+    if (new_count > 0) {
+        new_selected = old_selected < (int)new_count ? old_selected : (int)new_count - 1;
+        if (new_selected < 0) {
+            new_selected = 0;
+        }
+        if (selected_name[0] != '\0') {
+            for (size_t i = 0; i < new_count; i++) {
+                if (strcmp(new_entries[i].name, selected_name) == 0) {
+                    new_selected = (int)i;
+                    break;
+                }
+            }
+        }
+    }
+    /* Keep the cursor on the same screen row where possible. Panel has no
+     * notion of the visible height, but old_row was within it before, so
+     * scroll_offset = selected - old_row keeps the cursor visible (as long
+     * as the terminal wasn't shrunk meanwhile - panel_move_selection()
+     * fixes that up on the next key). Never scroll past the cursor. */
+    int new_scroll = new_selected - (old_row > 0 ? old_row : 0);
+    panel->scroll_offset = new_scroll > 0 ? new_scroll : 0;
+    panel->selected_index = new_selected;
     return 1;
 }
 
