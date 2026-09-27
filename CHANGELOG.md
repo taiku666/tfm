@@ -9,6 +9,15 @@ Versioned via `TFM_VERSION` in `include/tfm_common.h` and git tags
   (after F5/F6/F8, F9, the editor, a program or a `$` command), on the
   same screen row, instead of jumping back to the top - matching the
   GUI. If that entry is gone, the cursor lands on its neighbor.
+- GUI: the F10 Quit button no longer quits while the editor, a shell
+  command or a program is running; the F10 key already didn't.
+- GUI tests: `make test-gui` runs 14 tests against the real `tfm-gui`
+  window, headless under GTK's broadway backend: F-keys, function-bar
+  clicks, Enter and the shell line doing nothing during a running
+  operation, closing the window mid-operation, same-folder rename over an
+  existing file, multi-select delete and undo, the omarchy/system theme
+  switch, and the saved panel paths on exit. `make test-gui-asan` runs
+  them under ASan/UBSan. Both run in CI.
 - CI: `actions/checkout` bumped to v7 (Node 24), dropping the Node 20
   deprecation warning.
 

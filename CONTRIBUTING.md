@@ -5,10 +5,11 @@ TFM is early-stage software (see README). A GitHub Actions CI workflow
 pull request: it builds `tfm` under `-Werror`, runs the automated test
 suite (`tests/`, currently covering `src/fileops.c`, `src/tfm_common.c`,
 `src/config.c`, `src/input.c`, and `src/dir.c`) plus the slower PTY
-integration tests, builds `tfm-gui`, runs the ASan/UBSan test suite, and
-runs `cppcheck`. CI doesn't cover the GUI's own behavior or anything
-needing a real display/Hyprland session, so manual verification still
-matters more than usual for `src_gui/` changes.
+integration tests, builds `tfm-gui` and runs its headless GUI tests,
+runs the unit and GUI tests again under ASan/UBSan, and runs `cppcheck`.
+The GUI tests drive the real window under GTK's broadway backend, but
+nothing checks how it looks, so `src_gui/` changes still need a look in
+a real Hyprland session.
 
 ## Building
 
@@ -21,6 +22,8 @@ make test-pty   # slower: spawns real bin/tfm in a pty for signal/EOF/terminal-r
 make lint       # cppcheck, if installed
 make asan       # tfm rebuilt with -fsanitize=address,undefined
 make asan-test  # unit-test rebuilt with -fsanitize=address,undefined
+make test-gui   # tfm-gui tests, headless (needs gtk4-broadwayd; skipped without it)
+make test-gui-asan  # test-gui rebuilt with -fsanitize=address,undefined
 make compile_commands.json  # for clangd/LSP editors: real per-file flags (gitignored)
 ```
 
@@ -43,9 +46,11 @@ make compile_commands.json  # for clangd/LSP editors: real per-file flags (gitig
   for the pty-draining gotcha - a real, disposable pty via `make
   test-pty`, not just the pipe-based `tests/test_input.c`) as well as
   manual verification.
-- For anything touching `src_gui/`: launch `tfm-gui` for real (with an
-  isolated `$HOME` if it touches config/theme state) and confirm the
-  change visually before/after.
+- For anything touching `src_gui/`: add or extend a
+  `tests/gui_test_main.c` case (its header explains the dialog
+  responder) and keep `make test-gui` passing, then launch `tfm-gui` for
+  real (with an isolated `$HOME` if it touches config/theme state) and
+  confirm the change visually.
 - Run `make asan` and exercise the changed path at least once.
 
 ## Scope

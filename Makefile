@@ -53,11 +53,16 @@ TEST_BUILD_DIR = $(BUILD_DIR)/tests
 TEST_SRCS = $(wildcard $(TEST_DIR)/test_*.c)
 TEST_BINS = $(patsubst $(TEST_DIR)/%.c,$(TEST_BUILD_DIR)/%,$(TEST_SRCS))
 
+# GUI tests: one binary that #includes src_gui/gui_main.c, run headless
+# under broadway by tests/run_gui_tests.sh (see both files' headers).
+GUI_TEST_SRC = $(TEST_DIR)/gui_test_main.c
+GUI_TEST_BIN = $(TEST_BUILD_DIR)/gui_test_main
+
 # Auto-generated header-dependency files (see -MMD -MP below): included at
 # the bottom so editing a header (e.g. include/panel.h) correctly triggers
 # a rebuild of every .c file that includes it, not just the ones make's
 # own $(SRC_DIR)/%.c pattern rule already covers.
-DEPS = $(OBJS:.o=.d) $(GUI_OBJS:.o=.d)
+DEPS = $(OBJS:.o=.d) $(GUI_OBJS:.o=.d) $(GUI_TEST_BIN).d
 
 GTK_PKGS = gtk4 libadwaita-1
 GTK_CFLAGS := $(shell pkg-config --cflags $(GTK_PKGS) 2>/dev/null)
@@ -74,7 +79,8 @@ OMARCHY_HOOK_DIR = $(HOME)/.config/omarchy/hooks/theme-set.d
 OMARCHY_HOOK_SRC = contrib/omarchy-hooks/tfm-gui-reload-theme
 
 .PHONY: scan all clean install uninstall tfm-gui check-gtk-deps install-gui uninstall-gui \
-        install-gui-theme-hook uninstall-gui-theme-hook test unit-test smoke-test test-pty lint asan asan-test
+        install-gui-theme-hook uninstall-gui-theme-hook test unit-test smoke-test test-pty lint asan asan-test \
+        test-gui test-gui-asan
 
 all: $(TARGET)
 
@@ -223,6 +229,19 @@ $(PTY_TEST_BIN): $(PTY_TEST_SRC) $(TARGET) | $(TEST_BUILD_DIR)
 test-pty: $(PTY_TEST_BIN)
 	./$(PTY_TEST_BIN)
 
+$(GUI_TEST_BIN): $(GUI_TEST_SRC) $(GUI_SRC_DIR)/gui_main.c $(GUI_SRC_DIR)/omarchy_theme.c $(CORE_OBJS) | check-gtk-deps $(TEST_BUILD_DIR)
+	$(CC) $(ALL_CFLAGS) $(IFLAGS) -I$(GUI_SRC_DIR) $(GTK_CFLAGS) -MMD -MP $(GUI_TEST_SRC) \
+		$(GUI_SRC_DIR)/omarchy_theme.c $(CORE_OBJS) $(GTK_LIBS) -o $@
+
+test-gui: $(GUI_TEST_BIN)
+	./$(TEST_DIR)/run_gui_tests.sh $(GUI_TEST_BIN)
+
+# Leak checking is off (see tests/run_gui_tests.sh); use-after-free,
+# overflows and UB in tfm's own code still fail the run.
+test-gui-asan: CFLAGS = -fsanitize=address,undefined -g -O0
+test-gui-asan: export UBSAN_OPTIONS = halt_on_error=1:print_stacktrace=1
+test-gui-asan: clean test-gui
+
 # compile_commands.json for clangd and other LSP-based editors: each file's
 # real flags (notably GTK's include paths for src_gui/), which the language
 # server can't infer from this Makefile. Gitignored, since it holds absolute
@@ -231,7 +250,8 @@ CDB_ENTRY = {"directory": "$(CURDIR)", "file": "$(1)", "command": "$(CC) $(2) -c
 
 compile_commands.json: Makefile
 	@{ $(foreach f,$(SRCS) $(TEST_SRCS) $(PTY_TEST_SRC),echo '$(call CDB_ENTRY,$(f),$(ALL_CFLAGS) $(IFLAGS))';) \
-	   $(foreach f,$(GUI_SRCS),echo '$(call CDB_ENTRY,$(f),$(ALL_CFLAGS) $(IFLAGS) $(GTK_CFLAGS))';) } | \
+	   $(foreach f,$(GUI_SRCS),echo '$(call CDB_ENTRY,$(f),$(ALL_CFLAGS) $(IFLAGS) $(GTK_CFLAGS))';) \
+	   echo '$(call CDB_ENTRY,$(GUI_TEST_SRC),$(ALL_CFLAGS) $(IFLAGS) -I$(GUI_SRC_DIR) $(GTK_CFLAGS))'; } | \
 	 awk 'BEGIN { print "[" } NR > 1 { print prev "," } { prev = $$0 } END { if (NR) print prev; print "]" }' > $@
 	@echo "Wrote $@"
 
