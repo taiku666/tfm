@@ -1570,18 +1570,15 @@ static void on_function_button_clicked(GtkButton *button, gpointer user_data)
 {
     GtkApplication *app = user_data;
     const char *key = g_object_get_data(G_OBJECT(button), "tfm-key");
+    /* The bar stays clickable during an editor session, a shell command
+     * or a program (no dialog covers it), so it needs the same guard as
+     * the F-keys - F10 included, or a click quits mid-operation. */
+    if (g_modal_depth > 0) {
+        return;
+    }
     if (strcmp(key, "F10") == 0) {
         g_application_quit(G_APPLICATION(app));
-        return;
-    }
-    if (g_modal_depth > 0) {
-        /* Unlike the keyboard controller (:1270) and window-close
-         * (:1360), these mouse clicks had no g_modal_depth guard at all -
-         * a click during an editor session or a pumped fileop could
-         * re-enter copy/move/mkdir/delete on the same file. */
-        return;
-    }
-    if (strcmp(key, "F3") == 0) {
+    } else if (strcmp(key, "F3") == 0) {
         action_edit();
     } else if (strcmp(key, "F5") == 0) {
         action_copy();
@@ -1953,9 +1950,10 @@ static gboolean on_window_key_pressed(GtkEventControllerKey *controller, guint k
 }
 
 /* g_modal_depth only guards the window's key controller, not the window
- * close itself. A compositor-side close (SUPER+Q, CSD close button)
- * bypasses any AdwDialog grab and is delivered while a fileop pumps the
- * main context or a nested GMainLoop waits on a dialog - destroying the
+ * close itself. A compositor-side close (SUPER+Q, CSD close button) while
+ * a dialog is up never gets here: libadwaita answers the dialog with its
+ * close response instead, which is never destructive. It does get here
+ * during an editor session, shell command or program, and destroying the
  * window then would leave callbacks running on freed widgets. */
 static gboolean on_window_close_request(GtkWindow *window, gpointer user_data)
 {
