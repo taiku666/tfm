@@ -738,6 +738,34 @@ TEST(reload_keeps_the_selection_by_name)
     ASSERT_STR_EQ(selected_name(&g_panel[0]), "c");
 }
 
+TEST(reload_moves_the_selection_to_a_neighbor_when_the_entry_is_gone)
+{
+    reset_fixture();
+    char path[PATH_MAX];
+
+    /* "..", "sub", a, b, c: "b" goes, the selection stays at its index. */
+    select_name(&g_panel[0], "b");
+    fixture_path(path, g_left, "b");
+    ASSERT_EQ(unlink(path), 0);
+    panel_load(&g_panel[0], g_panel[0].path);
+    ASSERT_STR_EQ(selected_name(&g_panel[0]), "c");
+
+    /* The last entry goes: clamped to the new last one. */
+    fixture_path(path, g_left, "c");
+    ASSERT_EQ(unlink(path), 0);
+    panel_load(&g_panel[0], g_panel[0].path);
+    ASSERT_STR_EQ(selected_name(&g_panel[0]), "a");
+
+    /* A different folder still starts at the top. */
+    fixture_path(path, g_left, "sub/x1");
+    write_file(path, "x");
+    fixture_path(path, g_left, "sub/x2");
+    write_file(path, "x");
+    select_name(&g_panel[0], "a");
+    panel_navigate_into(&g_panel[0], "sub");
+    ASSERT_STR_EQ(selected_name(&g_panel[0]), "..");
+}
+
 static gboolean theme_provider_gone(void)
 {
     return g_theme_css_provider == NULL;
@@ -839,6 +867,7 @@ static gboolean run_all_tests(gpointer user_data)
     TFM_RUN(nothing_else_starts_while_a_program_runs);
     TFM_RUN(marks_survive_a_reload_and_batch_delete_and_undo_round_trip);
     TFM_RUN(reload_keeps_the_selection_by_name);
+    TFM_RUN(reload_moves_the_selection_to_a_neighbor_when_the_entry_is_gone);
     TFM_RUN(sigusr1_theme_toggle_omarchy_to_system_and_back);
     TFM_RUN(shutdown_never_saves_an_empty_panel_path);
     g_exit_status = TFM_SUMMARY();

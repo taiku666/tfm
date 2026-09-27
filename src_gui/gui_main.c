@@ -254,6 +254,7 @@ static int panel_load_indexed(GuiPanel *panel, const char *path, int panel_index
      * replacement, so a reload would otherwise throw the user back to the
      * top of a long listing. */
     char selected_name[256] = "";
+    guint old_position = GTK_INVALID_LIST_POSITION;
     GtkSelectionModel *old_model = gtk_list_view_get_model(GTK_LIST_VIEW(panel->list_view));
     if (old_model != NULL) {
         TfmFileItem *cur =
@@ -261,13 +262,15 @@ static int panel_load_indexed(GuiPanel *panel, const char *path, int panel_index
         if (cur != NULL) {
             snprintf(selected_name, sizeof(selected_name), "%s", cur->name);
         }
+        old_position = gtk_single_selection_get_selected(GTK_SINGLE_SELECTION(old_model));
     }
+    gboolean same_folder = strcmp(path, panel->path) == 0;
 
     /* Marks survive a reload of the same folder, by name, and are dropped
      * when the panel moves to another one - same rules as the TUI's
      * panel_reload()/panel_change_dir(). */
     GHashTable *marked_names = NULL;
-    if (strcmp(path, panel->path) == 0) {
+    if (same_folder) {
         guint n = g_list_model_get_n_items(G_LIST_MODEL(panel->store));
         for (guint i = 0; i < n; i++) {
             TfmFileItem *old_item = g_list_model_get_item(G_LIST_MODEL(panel->store), i);
@@ -303,9 +306,16 @@ static int panel_load_indexed(GuiPanel *panel, const char *path, int panel_index
     }
 
     /* old_model is still valid: remove_all()/append() mutate the store in
-     * place. Re-select by name, or the top entry if that item is gone. */
+     * place. Re-select by name; if that item is gone from this same
+     * folder, keep the position (clamped) so it lands on a neighbor, like
+     * the TUI's panel_reload(). A different folder starts at the top. */
     if (old_model != NULL && count > 0) {
-        guint index_to_select = restore_found ? restore_index : 0;
+        guint index_to_select = 0;
+        if (restore_found) {
+            index_to_select = restore_index;
+        } else if (same_folder && old_position != GTK_INVALID_LIST_POSITION) {
+            index_to_select = MIN(old_position, (guint)count - 1);
+        }
         gtk_single_selection_set_selected(GTK_SINGLE_SELECTION(old_model), index_to_select);
         /* Selecting an item outside the currently visible rows doesn't
          * by itself scroll it into view. */
