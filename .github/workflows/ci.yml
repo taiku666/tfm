@@ -18,7 +18,7 @@ jobs:
       - name: Install GUI + lint dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libgtk-4-bin libadwaita-1-dev cppcheck clang-tools
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev cppcheck clang-tools
 
       # -Werror here (not baked into the Makefile's own defaults) automates
       # CONTRIBUTING.md's "build with zero warnings" requirement for tfm's
@@ -54,22 +54,11 @@ jobs:
       - name: Build tfm-gui
         run: make tfm-gui
 
-      # Headless under broadway (gtk4-broadwayd, from libgtk-4-bin).
-      - name: GUI tests
-        run: make test-gui
-        env:
-          TFM_REQUIRE_GUI_TESTS: 1
-
       # Rebuilds everything from scratch under -fsanitize=address,undefined
       # (asan-test's own `clean` prerequisite handles that) - catches
       # memory/UB bugs the plain build and Werror can't.
       - name: ASan/UBSan unit test suite
         run: make asan-test
-
-      - name: ASan/UBSan GUI tests
-        run: make test-gui-asan
-        env:
-          TFM_REQUIRE_GUI_TESTS: 1
 
       - name: Lint (cppcheck)
         run: make lint
@@ -78,3 +67,24 @@ jobs:
       # fails on any finding. Runs last since it starts with `make clean`.
       - name: Static analysis (scan-build)
         run: make scan
+
+  # Headless under broadway, on Arch for a current GTK/libadwaita: with no
+  # browser attached, broadway stalls the frame clock after a tick or two,
+  # and libadwaita 1.5 (ubuntu-latest) only opens and closes a dialog's
+  # sheet on frame ticks, so dialogs never leave its dialog list there.
+  gui-tests:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    env:
+      TFM_REQUIRE_GUI_TESTS: 1
+    steps:
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm --needed base-devel git gtk4 libadwaita ttf-dejavu
+
+      - uses: actions/checkout@v7
+
+      - name: GUI tests
+        run: make test-gui
+
+      - name: ASan/UBSan GUI tests
+        run: make test-gui-asan
