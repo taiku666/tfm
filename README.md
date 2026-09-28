@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/taiku666/tfm/actions/workflows/ci.yml/badge.svg)](https://github.com/taiku666/tfm/actions/workflows/ci.yml)
 
+[![Built for Omarchy: Plugin](https://raw.githubusercontent.com/tcballard/omarchy-badges/75975e5b5bf75e7ede3764bcd2950046f7abfe2c/badges/v1/omarchy-plugin.svg)](https://github.com/tcballard/omarchy-badges)
+
 A dual-panel terminal file manager written in C, built for
 Omarchy/Hyprland. Ships **two front-ends that share one core**: a
 dependency-free terminal UI, and an optional GTK4/libadwaita GUI that
